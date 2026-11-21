@@ -1,4 +1,5 @@
 # LOCALIZACAO_FIXA (19/11): arena_11-11_1938 em mode localization (mapa fixo), carregada no START com match_type 3.
+import os  # PAREDES_SALVAS (21/11)
 from pathlib import Path
 
 import yaml
@@ -40,5 +41,10 @@ def generate_launch_description():
         ("mapa", ["ros2", "service", "call", "/slam_toolbox/deserialize_map",
                   "slam_toolbox/srv/DeserializePoseGraph", yaml.safe_dump(request)]),
     ]:
-        actions.append(ExecuteProcess(name=name, cmd=command, output="screen"))
+        # PAREDES_SALVAS (21/11): fitas salvas ao lado do mapa; modo vem do abrir_arena.sh.
+        extra = {}
+        if name == "parede_virtual":
+            extra = dict(additional_env={"PAREDES_FITA_ARQUIVO": f"{map_base}_fitas.json",
+                                         "PAREDES_FITA_MODO": os.environ.get("PAREDES_FITA_MODO", "load")})
+        actions.append(ExecuteProcess(name=name, cmd=command, output="screen", **extra))
     return LaunchDescription(actions)

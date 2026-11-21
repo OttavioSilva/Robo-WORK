@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import cv2
 import numpy as np
-from .projection import load_calibration
+from .projection import load_calibration, calibration_from_dict, to_ground
 
 
 def validated_base_calibration(preview, checks, offset_x, offset_y, max_error=.02):
@@ -15,8 +15,11 @@ def validated_base_calibration(preview, checks, offset_x, offset_y, max_error=.0
     """
     if not np.isfinite([offset_x,offset_y,max_error]).all() or not 0 < max_error <= .03:
         raise ValueError('Invalid measured offsets or validation tolerance')
-    if preview.get('frame_id') != 'virtual_wall_front' or preview.get('image_space') != 'raw':
+    if preview.get('frame_id') != 'virtual_wall_front' or preview.get('image_space') not in ('raw', 'undistorted'):
         raise ValueError('Expected raw-image front preview')
+    # Raw previews keep the old minimal contract; lens previews are fully checked.
+    model = (calibration_from_dict(preview, preview=True)
+             if preview.get('image_space') == 'undistorted' else (np.asarray(preview['H'], float),))
     if 'image_size' in checks and checks['image_size'] != preview.get('image_size'):
         raise ValueError('Checks and calibration image resolutions differ')
     pixels = np.asarray(checks['pixels'],dtype=float)
@@ -36,7 +39,7 @@ def validated_base_calibration(preview, checks, offset_x, offset_y, max_error=.0
     if np.linalg.norm(pixels[:,None,:]-fitting_pixels[None,:,:],axis=2).min() < 3:
         raise ValueError('Validation must not reuse fitting crosses')
     H = np.asarray(preview['H'],dtype=float)
-    homogeneous = np.column_stack((pixels,np.ones(len(pixels)))) @ H.T
+    homogeneous = to_ground(model, pixels)
     if (np.abs(homogeneous[:,2]) < 1e-9).any():
         raise ValueError('Invalid projection at validation points')
     predicted = homogeneous[:,:2]/homogeneous[:,2,None]

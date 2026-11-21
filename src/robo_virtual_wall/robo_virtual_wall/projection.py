@@ -1,16 +1,60 @@
-"""Validated planar projection. No implicit pixel/metre scale or legacy frame."""
+"""Validated planar projection. No implicit pixel/metre scale or legacy frame.
+
+CALIBRACAO_CHARUCO_20261121: besides image_space 'raw' (H maps raw pixels),
+'undistorted' calibrations carry camera_matrix/dist_coeffs and H maps
+undistorted pixels (cv2.undistortPoints with P=K). Raw pixels stay the
+interface everywhere: model_pixels() converts before applying H. Valid
+polygons are always in raw pixels.
+"""
 import json
 import cv2
 import numpy as np
+
+DIST_LENGTHS = (4, 5, 8, 12, 14)
+
+
+class Calibration(tuple):
+    """(H, image_size, raw polygon) plus an optional lens model.
+
+    Still unpacks as the old 3-tuple, so existing call sites keep working.
+    """
+    def __new__(cls, matrix, size, polygon, camera_matrix=None, dist_coeffs=None):
+        item = super().__new__(cls, (matrix, size, polygon))
+        item.camera_matrix, item.dist_coeffs = camera_matrix, dist_coeffs
+        return item
+
+    @property
+    def undistorted(self):
+        return self.camera_matrix is not None
+
+
+def model_pixels(calibration, pixels):
+    """Raw pixels -> the pixel space H expects (identity for raw calibrations)."""
+    points = np.asarray(pixels, dtype=np.float64).reshape(-1, 2)
+    if getattr(calibration, 'camera_matrix', None) is None:
+        return points
+    return cv2.undistortPoints(points.reshape(-1, 1, 2), calibration.camera_matrix,
+                               calibration.dist_coeffs, P=calibration.camera_matrix).reshape(-1, 2)
+
+
+def to_ground(calibration, pixels):
+    """Homogeneous ground coordinates (N x 3) of raw pixels."""
+    model = model_pixels(calibration, pixels)
+    return np.column_stack((model, np.ones(len(model)))) @ np.asarray(calibration[0]).T
 
 
 def load_calibration(path, preview=False):
     with open(path, encoding='utf-8') as stream:
         data = json.load(stream)
+    return calibration_from_dict(data, preview)
+
+
+def calibration_from_dict(data, preview=False):
     expected_frame = 'virtual_wall_front' if preview else 'base_link'
     if data.get('frame_id') != expected_frame or data.get('units') != 'm':
         raise ValueError('Calibration requires frame_id=base_link and units=m')
-    if data.get('image_space') != 'raw' or (not preview and data.get('validated') is not True):
+    if (data.get('image_space') not in ('raw', 'undistorted')
+            or (not preview and data.get('validated') is not True)):
         raise ValueError('Requires validated raw-image homography for this fixed mount')
     size = data.get('image_size', [])
     if len(size) != 2 or any(type(v) is not int or v <= 0 for v in size):
@@ -27,7 +71,16 @@ def load_calibration(path, preview=False):
         raise ValueError('Invalid calibration polygon')
     if (polygon < 0).any() or (polygon[:, 0] >= size[0]).any() or (polygon[:, 1] >= size[1]).any():
         raise ValueError('Calibration polygon outside image')
-    return matrix, tuple(size), polygon
+    if data['image_space'] == 'raw':
+        return Calibration(matrix, tuple(size), polygon)
+    camera = np.asarray(data.get('camera_matrix'), dtype=np.float64)
+    dist = np.asarray(data.get('dist_coeffs'), dtype=np.float64).ravel()
+    if (camera.shape != (3, 3) or not np.isfinite(camera).all() or camera[0, 0] <= 0
+            or camera[1, 1] <= 0 or abs(camera[2, 2] - 1) > 1e-9):
+        raise ValueError('camera_matrix must be a finite 3x3 intrinsic matrix')
+    if len(dist) not in DIST_LENGTHS or not np.isfinite(dist).all():
+        raise ValueError('dist_coeffs must have 4, 5, 8, 12 or 14 finite values')
+    return Calibration(matrix, tuple(size), polygon, camera, dist)
 
 
 def project_segment(segment, calibration, image_size, max_range):
@@ -39,7 +92,7 @@ def project_segment(segment, calibration, image_size, max_range):
         return None
     if any(cv2.pointPolygonTest(polygon, tuple(p), False) < 0 for p in pixels):
         return None
-    homogeneous = np.column_stack((pixels, np.ones(2))) @ matrix.T
+    homogeneous = to_ground(calibration, pixels)
     denominator = homogeneous[:, 2]
     # Reject a segment crossing the projective horizon.
     if (np.abs(denominator) < 1e-9).any() or denominator[0] * denominator[1] <= 0:
@@ -64,7 +117,7 @@ def centreline_intersection(segment, calibration, image_size, max_range=3.0):
     pixels = np.asarray(segment, dtype=float)
     if pixels.shape != (2, 2) or not np.isfinite(pixels).all():
         return None
-    homogeneous = np.column_stack((pixels, np.ones(2))) @ matrix.T
+    homogeneous = to_ground(calibration, pixels)
     denominator = homogeneous[:, 2]
     if (np.abs(denominator) < 1e-9).any() or denominator.prod() <= 0:
         return None
@@ -99,7 +152,7 @@ def preview_observation(segment, calibration, image_size, max_range=3.0):
     clipped = clip_segment(segment, polygon)
     if clipped is None:
         return dict(kind='outside')
-    h = np.column_stack((clipped, np.ones(2))) @ matrix.T
+    h = to_ground(calibration, clipped)
     if (np.abs(h[:, 2]) < 1e-9).any() or h[0, 2]*h[1, 2] <= 0:
         return dict(kind='invalid')
     ground = h[:, :2]/h[:, 2, None]
@@ -162,6 +215,8 @@ def resize_preview(calibration, image_size):
     Equal aspect ratio is necessary, but cannot prove equal camera framing.
     """
     matrix, old_size, polygon = calibration
+    if getattr(calibration, 'undistorted', False):
+        raise ValueError('Lens-model calibration cannot be rescaled; recalibrate at this resolution')
     width,height = image_size
     if min(width,height) <= 0 or width*old_size[1] != height*old_size[0]:
         raise ValueError('Preview resize requires the same aspect ratio; recalibrate')

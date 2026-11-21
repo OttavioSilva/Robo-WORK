@@ -1,0 +1,512 @@
+{
+  "H": [
+    [
+      -3.9294831097352065e-05,
+      -0.0012683005781469823,
+      1.6711346310517057
+    ],
+    [
+      -0.0024269060605750944,
+      0.00024407287661516302,
+      0.7099782170324304
+    ],
+    [
+      -4.4288632097011336e-05,
+      0.0035045968705087797,
+      1.0
+    ]
+  ],
+  "frame_id": "base_link",
+  "units": "m",
+  "image_space": "raw",
+  "validated": true,
+  "image_size": [
+    640,
+    480
+  ],
+  "valid_pixels": [
+    [
+      635.617919921875,
+      104.09700012207031
+    ],
+    [
+      535.5296630859375,
+      226.38021850585938
+    ],
+    [
+      368.5980224609375,
+      233.6920928955078
+    ],
+    [
+      147.5205841064453,
+      235.43296813964844
+    ],
+    [
+      10.919238090515137,
+      234.88392639160156
+    ],
+    [
+      20.9793701171875,
+      94.14142608642578
+    ],
+    [
+      109.09186553955078,
+      51.29248809814453
+    ],
+    [
+      295.1130065917969,
+      31.88085174560547
+    ],
+    [
+      438.2422180175781,
+      35.457035064697266
+    ],
+    [
+      589.207275390625,
+      53.06242370605469
+    ]
+  ],
+  "pixels": [
+    [
+      147.5205791451773,
+      235.4329657792663
+    ],
+    [
+      368.5980265412062,
+      233.69208311311849
+    ],
+    [
+      187.3890739138687,
+      139.5919845365288
+    ],
+    [
+      361.66504911392406,
+      140.16829201913816
+    ],
+    [
+      20.97936994742889,
+      94.14142643231435
+    ],
+    [
+      109.09186346162812,
+      51.29248625669055
+    ],
+    [
+      295.1130194265398,
+      31.880852608402826
+    ],
+    [
+      438.2422277254725,
+      35.45703630607953
+    ],
+    [
+      589.2072582264809,
+      53.0624249485174
+    ],
+    [
+      635.6179411381888,
+      104.09700311343926
+    ],
+    [
+      535.5296395731189,
+      226.38022205551812
+    ],
+    [
+      10.919238044197808,
+      234.88393238253332
+    ],
+    [
+      467.2823985404071,
+      98.35807356504279
+    ]
+  ],
+  "metres": [
+    [
+      0.755,
+      0.205
+    ],
+    [
+      0.755,
+      -0.085
+    ],
+    [
+      1.011,
+      0.2
+    ],
+    [
+      1.01,
+      -0.1
+    ],
+    [
+      1.175,
+      0.515
+    ],
+    [
+      1.35,
+      0.39
+    ],
+    [
+      1.465,
+      0.0
+    ],
+    [
+      1.465,
+      -0.32
+    ],
+    [
+      1.3699999999999999,
+      -0.625
+    ],
+    [
+      1.135,
+      -0.585
+    ],
+    [
+      0.755,
+      -0.3
+    ],
+    [
+      0.755,
+      0.425
+    ],
+    [
+      1.145,
+      -0.28
+    ]
+  ],
+  "source": "Diagnostic preview registered to current floor features; independent target excluded from registration mask. Promoted after static commissioning: three independent points (not used in the fit or registration) gave 0.55 to 1.26 cm error with the robot stopped. Accuracy while moving is NOT validated (texto corrigido 2026-11-21).",
+  "source_image": "raw-20261113-212417-370244.png",
+  "fitting_errors_m": [
+    0.02042877902766144,
+    0.014257520124282212,
+    0.008475237453656593,
+    0.011985615313866141,
+    0.00822280940686238,
+    0.01331845455277501,
+    0.008821765594639697,
+    0.011718151916206083,
+    0.017020623023423522,
+    0.01902122537962728,
+    0.015324016430167018,
+    0.01865347477828061,
+    0.023953438071788416
+  ],
+  "observations": [
+    {
+      "number": 1,
+      "pixel": [
+        139.99,
+        233.42
+      ],
+      "metres": [
+        0.39,
+        0.205
+      ],
+      "predicted_m": [
+        0.38654789996072375,
+        0.22513499485671273
+      ],
+      "error_cm": 2.042877902766144
+    },
+    {
+      "number": 2,
+      "pixel": [
+        361.78,
+        231.46
+      ],
+      "metres": [
+        0.39,
+        -0.085
+      ],
+      "predicted_m": [
+        0.38957928558309307,
+        -0.07074868849987066
+      ],
+      "error_cm": 1.4257520124282212
+    },
+    {
+      "number": 3,
+      "pixel": [
+        180.0,
+        137.0
+      ],
+      "metres": [
+        0.6459999999999999,
+        0.2
+      ],
+      "predicted_m": [
+        0.6389247291035399,
+        0.19533414620486564
+      ],
+      "error_cm": 0.8475237453656593
+    },
+    {
+      "number": 4,
+      "pixel": [
+        354.73,
+        137.73
+      ],
+      "metres": [
+        0.645,
+        -0.1
+      ],
+      "predicted_m": [
+        0.637665258345341,
+        -0.09052073107716671
+      ],
+      "error_cm": 1.198561531386614
+    },
+    {
+      "number": 5,
+      "pixel": [
+        12.0,
+        91.0
+      ],
+      "metres": [
+        0.81,
+        0.515
+      ],
+      "predicted_m": [
+        0.8019768679023923,
+        0.513198904254094
+      ],
+      "error_cm": 0.822280940686238
+    },
+    {
+      "number": 6,
+      "pixel": [
+        101.0,
+        48.0
+      ],
+      "metres": [
+        0.985,
+        0.39
+      ],
+      "predicted_m": [
+        0.9983121798034819,
+        0.3895912206535272
+      ],
+      "error_cm": 1.331845455277501
+    },
+    {
+      "number": 7,
+      "pixel": [
+        288.0,
+        29.0
+      ],
+      "metres": [
+        1.1,
+        0.0
+      ],
+      "predicted_m": [
+        1.1087085343170215,
+        0.001408892563692617
+      ],
+      "error_cm": 0.8821765594639698
+    },
+    {
+      "number": 8,
+      "pixel": [
+        431.0,
+        33.0
+      ],
+      "metres": [
+        1.1,
+        -0.32
+      ],
+      "predicted_m": [
+        1.091250843425602,
+        -0.3122046588549344
+      ],
+      "error_cm": 1.1718151916206083
+    },
+    {
+      "number": 9,
+      "pixel": [
+        581.0,
+        51.0
+      ],
+      "metres": [
+        1.005,
+        -0.625
+      ],
+      "predicted_m": [
+        0.9978135127422093,
+        -0.6095709362241545
+      ],
+      "error_cm": 1.7020623023423522
+    },
+    {
+      "number": 10,
+      "pixel": [
+        627.0,
+        102.0
+      ],
+      "metres": [
+        0.77,
+        -0.585
+      ],
+      "predicted_m": [
+        0.7677663578487096,
+        -0.603889623015893
+      ],
+      "error_cm": 1.902122537962728
+    },
+    {
+      "number": 11,
+      "pixel": [
+        528.0,
+        224.0
+      ],
+      "metres": [
+        0.39,
+        -0.3
+      ],
+      "predicted_m": [
+        0.40519195283750536,
+        -0.3020074980784653
+      ],
+      "error_cm": 1.5324016430167018
+    },
+    {
+      "number": 12,
+      "pixel": [
+        2.0,
+        233.0
+      ],
+      "metres": [
+        0.39,
+        0.425
+      ],
+      "predicted_m": [
+        0.3881737225447326,
+        0.40643614178139864
+      ],
+      "error_cm": 1.865347477828061
+    },
+    {
+      "number": 13,
+      "pixel": [
+        460.0,
+        96.0
+      ],
+      "metres": [
+        0.78,
+        -0.28
+      ],
+      "predicted_m": [
+        0.7890888156423967,
+        -0.3021621439774569
+      ],
+      "error_cm": 2.3953438071788415
+    }
+  ],
+  "validation": {
+    "front_reference_checks": {
+      "image_size": [
+        640,
+        480
+      ],
+      "frame_id": "virtual_wall_front",
+      "pixels": [
+        [
+          203.0,
+          73.0
+        ],
+        [
+          453.0,
+          122.0
+        ],
+        [
+          100.0,
+          189.0
+        ]
+      ],
+      "metres": [
+        [
+          0.9,
+          0.2
+        ],
+        [
+          0.7,
+          -0.25
+        ],
+        [
+          0.5,
+          0.3
+        ]
+      ],
+      "observations": [
+        {
+          "source_image": "raw-20261113-212417-370244.png",
+          "predicted_m": [
+            0.8946368147564828,
+            0.18858287168428023
+          ],
+          "error_m": 0.012614062586410893
+        },
+        {
+          "source_image": "raw-20261113-212759-345790.png",
+          "predicted_m": [
+            0.6997271468776699,
+            -0.25551249104539897
+          ],
+          "error_m": 0.005519239653427734
+        },
+        {
+          "source_image": "raw-20261113-213026-837696.png",
+          "predicted_m": [
+            0.49600605917889157,
+            0.3096718829325199
+          ],
+          "error_m": 0.010464075818861709
+        }
+      ],
+      "source_preview": "/home/marcos/Robo-WORK/src/robo_virtual_wall/calibration/front_diagnostic_registered_20261113_212518.json",
+      "notes": "Three independent marks, not used in homography fit or image registration. User saved each after requested physical placement. First mark position explicitly confirmed."
+    },
+    "errors_m": [
+      0.012614062586410893,
+      0.005519239653427734,
+      0.010464075818861709
+    ],
+    "max_error_m": 0.02,
+    "scope": "static_commissioning_only_three_independent_points",
+    "front_offset_source": "User-confirmed front white edge +0.365 m from base_link on 2026-11-06; unchanged robot, matches current nav2_params_principal.yaml footprint front.",
+    "limitations": [
+      "Raw-image homography, no lens distortion correction.",
+      "Original 13-mark fitting maximum residual about 2.4 cm; three independent checks below 2 cm.",
+      "Pixel reference positions transferred by floor image registration.",
+      "No motion test, full-region accuracy guarantee or runtime Nav2 verification.",
+      "Calibration requires current fixed mount, focus disabled and 640x480 camera mode."
+    ]
+  },
+  "registration": {
+    "source_calibration": "front_diagnostic_expanded_20261113_211934.json",
+    "method": "ORB floor features + homography RANSAC 1.5 px",
+    "inliers": 170,
+    "matches": 247,
+    "image_transform": [
+      [
+        0.9870941207048366,
+        -0.0013014131147110668,
+        9.24789536301148
+      ],
+      [
+        -0.0035247134177924305,
+        0.9909889186623497,
+        3.9823100799209796
+      ],
+      [
+        -1.9058937404006997e-05,
+        1.2783141496932635e-08,
+        1.0
+      ]
+    ],
+    "pixel_method": "Inferred positions from image registration, not new manual clicks."
+  },
+  "front_offset_base_link_m": [
+    0.365,
+    0.0
+  ]
+}

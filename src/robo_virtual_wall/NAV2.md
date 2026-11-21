@@ -1,5 +1,119 @@
 # Parede de fita no Nav2 Jazzy
 
+## Retirada da fita — 13/11/2026
+
+A marcação continua exigindo três observações compatíveis. No perfil operacional,
+`remove_visible_missing=true` permite retirar paredes ausentes apenas enquanto
+o robô está parado e os extremos do trecho estão na área calibrada observada.
+Exige odometria recente, um segundo parado e pelo menos seis imagens distintas
+durante dois segundos de ausência contínua. Movimento, perda de visão/calibração,
+intervalo de imagens, odometria antiga ou mudança relevante do TF reiniciam a
+contagem. Parede fora da imagem continua memorizada; não há TTL global.
+
+O campo `observed_ground_base_link_m` acompanha a resolução, ROI e domínio
+calibrados. Imagem muito escura/sem textura não fornece evidência para remoção;
+com máscara da garra configurada a evidência de remoção fica desabilitada. O teste
+atual continua SEM máscara. Ausência na imagem não é segmentação semântica do
+chão: objetos claros que encubram a fita não são distinguidos de sua retirada.
+Validar com o chão desobstruído e garra fora da observação, conforme o ensaio atual.
+
+Visão e keepout foram recarregados isoladamente pela
+`observation_tape.launch.py`, com a base e os servidores Nav2 anteriores mantidos.
+A memória de sessão anterior foi reiniciada nessa troca e reobservada. Os comandos
+08/11 usam `install_retirada_fita_20261113`; futuras subidas pelo terminal 11
+habilitam a mesma regra. Supervisor observar e árbitro exclusivo reconferidos.
+61 testes passaram; teste isolado do costmap real confirmou desaparecimento de
+custo letal e inflação ao retirar a máscara. Retirada física ainda deve ser
+conferida pelo operador. Evidências/rollback em
+`entregas/retirada_fita_20261113_220944/RELATORIO.md`.
+
+## Teste atual sem máscara da garra — 13/11/2026
+
+A pedido do usuário, terminais 08 e 11 não carregam máscara da garra, fixa ou
+dinâmica. A garra será posicionada fora da observação durante o mapeamento da fita.
+Mantidos calibração ampliada, corte inferior ROI e filtros normais do detector.
+O campo self_mask_file real foi conferido vazio. Perfil principal/observar ativo,
+árbitro exclusivo e KeepoutFilter/inflação carregados nos dois costmaps. Na amostra
+estática, as 121 células da máscara estavam letais em ambos os costmaps.
+
+Teste iniciado com mapa novo pelo SLAM mapping original; não carregou START salvo
+nem alterou mapas existentes. A preparação não enviou goals ou velocidades.
+O RViz do terminal 11 usa tape_nav2_test.rviz com ferramenta de goal publicada em
+/goal_pose_alinhado, conforme a interface supervisionada existente, e exibe /plan.
+Parede confirmada permanece em memória mesmo se a fita for movida ou sair da imagem.
+Detalhes e rollback: entregas/nav2_sem_mascara_20261113_215556/RELATORIO.md.
+
+As descrições de máscara fixa/dinâmica abaixo são históricas e não representam
+uma máscara ativa neste teste.
+
+## Perfil atual — 13/11/2026
+
+### Prévia dinâmica da garra — experimental
+
+`bash ~/Robo-WORK/terminais/08-validar-fita.sh --pane camera dynamic` usa
+`install_garra_dinamica_20261113`, `self_mask_mode=dynamic` e a referência da pose
+atual em `config/dynamic_gripper_current_20261113.json`. Este é o padrão da janela
+de câmera; `--pane camera static` permite voltar à exclusão fixa.
+
+O rastreador segue separadamente dois lados da garra e corpo do braço, usando
+aparência SIFT e fluxo óptico LK com conferência de ida/volta. As regiões de
+detalhes visuais da referência atual excluem a fita adjacente. Transforma os
+polígonos de cada parte a cada quadro, com margem de cinco pixels, em vez de
+deslocar uma máscara única. Modelos locais rígidos são uma aproximação, não uma
+segmentação semântica completa da garra ou de todos os seus movimentos.
+
+Exige reconhecimento das três partes e distribuição espacial dos pontos. Perda
+do rastreio esvazia as detecções, retira o frame métrico e apaga os marcadores
+instantâneos. A tela informa `SEM RASTREIO - FITAS SUSPENSAS`; o JSON publica
+`perception_valid=false` e o estado de cada parte. Não envia parada ao hardware,
+não apaga paredes confirmadas do keepout e não substitui um intertravamento de
+saúde da visão. `R` salva também configuração e estado do rastreador no JSON.
+
+48 testes passaram, incluindo movimentos sintéticos diferentes por dedo,
+deslocamento, perda/reconhecimento e supressão métrica no adaptador ROS.
+Amostra real na pose atual: 40/40 quadros reconhecidos, com uma fita externa
+visível ainda detectada. Isso não valida extensão, abertura/fechamento, lateral,
+oclusões ou velocidades reais do braço. A primeira referência de pose anterior
+não reconheceu a pose atual; o sistema suspendeu as observações, e foi cadastrada
+a referência atual. Grandes mudanças de aparência podem exigir nova referência.
+
+O terminal 11 de navegação continua na instalação anterior com a máscara fixa.
+O protótipo dinâmico não foi promovido ao Nav2; deve ser ensaiado na câmera com
+o robô parado antes de qualquer ativação de navegação.
+
+A câmera foi reposicionada. Usar `front_base_link_expanded_validated_20261113.json`
+para comissionamento estático, com imagem raw 640x480 e foco automático desligado.
+As três verificações independentes tiveram erros totais de 1,26 / 0,55 / 1,05 cm.
+O ajuste das 13 referências tem resíduo máximo de 2,40 cm; esses três testes não
+certificam cada ponto da região ou desempenho em movimento. A região é o casco
+das referências medidas, recortado à imagem, não o campo inteiro sem medição.
+
+`terminais/11-ativar-fita-nav2.sh --validar` confere arquivos e overlay sem iniciar
+componentes. O script usa `install_nav2_principal`, `nav2_principal=true`, supervisor
+`observar` e a BT principal; acrescenta somente KeepoutFilter/inflação aos dois
+costmaps numa cópia temporária. Não altera o YAML operacional, árbitro, CM ou BT.
+O pacote de visão foi compilado isoladamente em `install_camera_nav2_20261113`.
+
+`bash ~/Robo-WORK/terminais/11-ativar-fita-nav2.sh` abre somente o terminal da
+integração; não sobe hardware, SLAM ou outra base. Exige mapa, odom, scan_nav e
+TF map/base_link disponíveis, foco fixo e ausência de outra navegação detectada
+num contexto ROS persistente. Recusa duplicação. Não reinicia Nav2 existente nem
+envia goals. Após a subida, conferir o perfil real com
+`~/robo_jazzy_ws/ferramentas/conferir_supervisor_ativo.py --modo observar` e os
+parâmetros/endpoints reais dos filtros antes de qualquer ensaio de movimento.
+RViz: `bash ~/Robo-WORK/terminais/11-ativar-fita-nav2.sh --rviz`.
+
+`self_mask_file` exclui a silhueta observada da garra antes do HSV, depois da
+morfologia e nos segmentos publicados, com contorno magenta na imagem. Usa
+`config/self_mask_20261113.json`; resolução diferente é recusada. A garra pode
+conter vermelho sem virar uma fita, mas chão oculto pela silhueta também fica
+sem observação. A máscara vale apenas para a pose observada de câmera/garra.
+Reposicionar o braço pode expor vermelho fora dela e exige nova máscara ou uma
+projeção dinâmica baseada na pose real do braço; isso não foi implementado.
+
+As seções abaixo registram o trabalho de 06/11. Não usar os comandos históricos
+para selecionar calibração antiga ou perfil legado no ensaio atual.
+
 O detector publica segmentos métricos atuais em `base_link` somente com
 `homography_file` validado. A prévia não alimenta a navegação. `tape_keepout`
 transforma cada observação para o frame de `/map` pelo TF no timestamp da imagem.

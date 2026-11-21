@@ -48,12 +48,16 @@ def unir_tracejado(mask):
     return united
 
 
-def repeticoes_na_faixa(contorno, vermelho, branco):
+def repeticoes_na_faixa(contorno, vermelho, branco, origem=(0, 0), forma=None):
     """Count repeated red AND white runs, even when chevron arms touch.
 
     Sample seven longitudinal lines in the rotated rectangle. Require evidence
     on at least two lines, so a single noisy pixel row cannot validate a band.
+    vermelho/branco may be a crop starting at ``origem`` of an image with
+    shape ``forma``; sampling stays in full-image coordinates (exact result).
     """
+    forma = vermelho.shape if forma is None else forma
+    x0, y0 = origem
     (cx, cy), (width, height), angle = cv2.minAreaRect(contorno)
     if width < height:
         width, height = height, width
@@ -64,11 +68,13 @@ def repeticoes_na_faixa(contorno, vermelho, branco):
     t = np.linspace(-width * .48, width * .48, max(2, int(width)))
     valid = 0
     region = np.zeros_like(vermelho)
-    cv2.drawContours(region, [contorno], -1, 255, -1)
+    cv2.drawContours(region, [contorno], -1, 255, -1, offset=(-x0, -y0))
     for offset in np.linspace(-height * .3, height * .3, 7):
         points = np.array([cx, cy]) + t[:, None] * axis + offset * normal
-        x = np.clip(np.rint(points[:, 0]).astype(int), 0, vermelho.shape[1] - 1)
-        y = np.clip(np.rint(points[:, 1]).astype(int), 0, vermelho.shape[0] - 1)
+        x = np.clip(np.rint(points[:, 0]).astype(int), 0, forma[1] - 1) - x0
+        y = np.clip(np.rint(points[:, 1]).astype(int), 0, forma[0] - 1) - y0
+        x = np.clip(x, 0, vermelho.shape[1] - 1)
+        y = np.clip(y, 0, vermelho.shape[0] - 1)
         labels = np.where(vermelho[y, x] > 0, 1, np.where(branco[y, x] > 0, 2, 0))
         labels[region[y, x] == 0] = 0
         edges = np.r_[0, np.flatnonzero(labels[1:] != labels[:-1]) + 1, len(labels)]
@@ -94,8 +100,21 @@ def parece_fita(contorno, mask_vermelho, hsv):
     if along < ALONGAMENTO_MIN:
         return False, f"along {along:.1f}"
 
+    # DETECTOR_RECORTE_20261121: work on a crop around the contour and its
+    # rotated rectangle (plus margin) instead of the whole 640x480 image.
+    # Everything outside the contour was already zeroed, so counts are equal.
+    corners = np.vstack((contorno.reshape(-1, 2).astype(float),
+                         cv2.boxPoints(cv2.minAreaRect(contorno))))
+    x0, y0 = (int(v) for v in np.maximum(np.floor(corners.min(axis=0)).astype(int) - 2, 0))
+    x1 = min(mask_vermelho.shape[1], int(np.ceil(corners[:, 0].max())) + 3)
+    y1 = min(mask_vermelho.shape[0], int(np.ceil(corners[:, 1].max())) + 3)
+    if x1 <= x0 or y1 <= y0:
+        return False, "branco 0.00"  # same as the empty full-image region
+    forma = mask_vermelho.shape
+    mask_vermelho = mask_vermelho[y0:y1, x0:x1]
+    hsv = hsv[y0:y1, x0:x1]
     regiao = np.zeros(mask_vermelho.shape, np.uint8)
-    cv2.drawContours(regiao, [contorno], -1, 255, -1)
+    cv2.drawContours(regiao, [contorno], -1, 255, -1, offset=(-x0, -y0))
 
     listras = cv2.bitwise_and(mask_vermelho, regiao)
     n, _, stats, _ = cv2.connectedComponentsWithStats(listras)
@@ -107,7 +126,8 @@ def parece_fita(contorno, mask_vermelho, hsv):
     frac = cv2.countNonZero(branco) / max(cv2.countNonZero(regiao), 1)
     if frac < FRACAO_BRANCO_MIN:
         return False, f"branco {frac:.2f}"
-    if n_listras < LISTRAS_MIN and not repeticoes_na_faixa(contorno, listras, branco):
+    if n_listras < LISTRAS_MIN and not repeticoes_na_faixa(contorno, listras, branco,
+                                                           (x0, y0), forma):
         return False, f"padrao {n_listras}"
     return True, "ok"
 

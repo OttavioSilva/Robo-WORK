@@ -144,3 +144,95 @@ def test_shorter_observations_do_not_accumulate_duplicate_mask_walls():
         assert not tracker.update([shorter])
     assert len(tracker.walls) == 1
     assert np.array_equal(tracker.walls[0],wall)
+
+
+# LINHA_FITA_20261121 -----------------------------------------------------------
+def confirm(tracker, observations):
+    for observation in observations:
+        tracker.update([np.asarray(observation, float)])
+
+
+def test_sliding_pieces_of_one_tape_confirm_while_moving():
+    # Robot driving along a long tape: each frame sees a different 40 cm piece.
+    tracker = WallTracker()
+    pieces = [[[.6, -.6 + .02 * k], [.6, -.2 + .02 * k]] for k in range(31)]   # last piece ends at y=0.4
+    confirm(tracker, pieces)
+    assert len(tracker.walls) == 1
+    wall = tracker.walls[0]
+    low, high = sorted(wall[:, 1])
+    assert abs(low + .6) < 1e-6                 # starts where the tape was first seen
+    assert .3 <= high <= .4 + 1e-6               # grew with the drive, never past what was seen
+    assert np.allclose(wall[:, 0], .6, atol=1e-6)
+
+
+def test_lateral_walk_still_rejected_with_sliding_rule():
+    tracker = WallTracker()
+    confirm(tracker, [[[.6 + .02 * k, -.2], [.6 + .02 * k, .2]] for k in range(12)])
+    assert not tracker.walls
+
+
+def test_collinear_new_piece_extends_existing_wall():
+    tracker = WallTracker()
+    confirm(tracker, [[[.6, -.3], [.6, 0.]]] * 3)
+    tracker.update([])
+    confirm(tracker, [[[.605, -.05], [.605, .4]]] * 3)    # return pass, 5 mm off
+    assert len(tracker.walls) == 1 and tracker.merged == 1
+    assert np.allclose(sorted(tracker.walls[0][:, 1]), [-.3, .4], atol=1e-6)
+    assert abs(tracker.walls[0][0, 0] - .6) < .006
+
+
+def test_l_and_square_tapes_stay_separate_walls():
+    tracker = WallTracker()
+    square = [[[0., 0.], [.5, 0.]], [[.5, 0.], [.5, .5]], [[.5, .5], [0., .5]], [[0., .5], [0., 0.]]]
+    for _ in range(3):
+        tracker.update([np.array(s) for s in square])
+    assert len(tracker.walls) == 4 and tracker.merged == 0
+    assert not tracker.inconsistent
+
+
+def test_rotated_copy_of_a_wall_is_kept_and_reported():
+    tracker = WallTracker()
+    confirm(tracker, [[[0., 0.], [1., 0.]]] * 3)
+    tracker.update([])
+    angle = math.radians(15)
+    confirm(tracker, [[[0., 0.], [math.cos(angle), math.sin(angle)]]] * 3)
+    assert len(tracker.walls) == 2              # conservative: both kept
+    assert len(tracker.inconsistent) == 1
+    assert abs(tracker.inconsistent[0]['angle_deg'] - 15) < .5
+
+
+def test_ten_cm_merge_absorbs_slam_jump_but_not_rotated_copy():
+    # FITA_ROBUSTA_20261121: node defaults (5 confirmations, 10 cm merge).
+    tracker = WallTracker(confirmations=5, merge_tolerance=.10)
+    confirm(tracker, [[[0., 0.], [1., 0.]]] * 5)
+    tracker.update([])
+    confirm(tracker, [[[.5, .08], [1.4, .08]]] * 5)      # same tape, pose jumped 8 cm
+    assert len(tracker.walls) == 1 and not tracker.inconsistent
+    tracker.update([])
+    angle = math.radians(18)
+    confirm(tracker, [[[0., 0.], [math.cos(angle), math.sin(angle)]]] * 5)
+    assert len(tracker.walls) == 2 and len(tracker.inconsistent) == 1
+    # Four frames of a look-alike are not enough for a new wall.
+    confirm(tracker, [[[2., 2.], [2.3, 2.]]] * 4)
+    assert len(tracker.walls) == 2
+
+
+def test_walls_file_roundtrip_and_refusals(tmp_path):
+    import json, pytest
+    from robo_virtual_wall.wall_map import save_walls, load_walls
+    walls = [np.array([[1., 2.], [1.5, 2.]]), np.array([[0., 0.], [0., .7]])]
+    path = tmp_path / 'arena_fitas.json'
+    assert save_walls(path, walls, 'map', 'teste') == 2
+    loaded = load_walls(path, 'map')
+    assert len(loaded) == 2 and np.allclose(loaded[0], walls[0])
+    assert not (tmp_path / 'arena_fitas.json.tmp').exists()
+    with pytest.raises(ValueError, match='frame'):
+        load_walls(path, 'odom')
+    data = json.loads(path.read_text())
+    data['walls'].append([[0, 0], [float('nan'), 1]])
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='invalida'):
+        load_walls(path, 'map')
+    path.write_text(json.dumps(dict(format='outro', frame_id='map', walls=[])))
+    with pytest.raises(ValueError, match='formato'):
+        load_walls(path, 'map')

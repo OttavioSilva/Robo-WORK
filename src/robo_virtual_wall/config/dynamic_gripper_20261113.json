@@ -1,0 +1,10 @@
+{
+  "image_size": [640, 480],
+  "reference_image": "dynamic_gripper_reference_20261113.png",
+  "parts": [
+    {"name": "dedo_esquerdo", "polygon": [[243,157],[277,154],[279,186],[261,237],[232,273],[209,289],[202,276],[218,248],[233,211]]},
+    {"name": "dedo_direito", "polygon": [[286,153],[312,153],[331,190],[335,232],[356,261],[351,288],[329,294],[301,266],[287,225]]},
+    {"name": "corpo_braco", "polygon": [[215,272],[328,272],[330,326],[347,400],[350,479],[165,479],[176,387],[193,333],[198,302]]}
+  ],
+  "scope": "Experimental image-based local articulated tracking. Requires all parts recognized. On loss, detections are suppressed; no velocity stop is issued. Actual extension/lateral/open-close sequences still require commissioning."
+}

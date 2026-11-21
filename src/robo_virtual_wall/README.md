@@ -273,3 +273,41 @@ transversal ficou igual nos dois quadros após o refinamento. Isso é uma regres
 sobre duas imagens, não uma medição de estabilidade temporal ao vivo. O teste
 exige duas fitas e diferença inferior a 5 mm nesse par; movimento e TF reais
 continuam exigindo conferência no robô.
+
+## Captura contínua, reconexão e paredes permanentes (21/11/2026)
+
+- `camera.py` (CAMERA_RECONEXAO_20261121): uma thread lê a XIFT na taxa da câmera
+  e guarda só o quadro mais novo (`CAP_PROP_BUFFERSIZE=1`). A hora da imagem é a da
+  aquisição: hora da leitura menos a idade do buffer V4L2, usada só se ficar entre
+  0 e `max_driver_age_s` (0,5 s), o que pressupõe o driver em CLOCK_MONOTONIC.
+  Fora disso, usa a hora da leitura e avisa. `CAMERA_LATENCIA` no log a cada 10 s
+  mostra idade no driver e tempo de processamento (mediana/p90).
+- Sem quadros por `reconnect_after_s` (2 s), a câmera é fechada e reaberta pelo mesmo
+  caminho (`/dev/v4l/by-id/...`), reaplicando `v4l2_controls` (foco) e o formato.
+  Só a captura reinicia; o `tape_keepout` e as paredes confirmadas continuam.
+- SEM_RETIRADA_20261121: `observation_tape.launch.py` agora usa
+  `remove_visible_missing:=false` por padrão. Fita confirmada fica no mapa até
+  `ros2 service call /tape_keepout/clear std_srvs/srv/Empty`. Use `true` só no teste
+  de retirada.
+- DETECTOR_RECORTE_20261121: `parece_fita` trabalha num recorte em volta do contorno.
+  Saída idêntica em 21 imagens/922 chamadas; mediana 118→89 ms, p90 229→171 ms.
+
+## Calibração ChArUco com correção de lente (21/11/2026)
+
+`~/calibrar_camera.sh` (ferramenta Tk sem ROS, em `ferramentas/calibracao/`). PDFs em
+`ferramentas/calibracao/imprimir/` (`lente_A4.pdf`, `chao_A3_4_folhas.pdf`; imprimir a 100%).
+
+1. **Lente:** tabuleiro A4 na mão, fotos automáticas quando parado; `calibrate_lens` com
+   descarte de fotos ruins. Gera `calibration/lente_xift_*.json` (uma vez por câmera).
+2. **Chão:** folhas A3 no chão; trena só nos cantos A e B de cada folha (frente da borda
+   branca, lateral do centro, + esquerda). PnP conjunto dá a pose da câmera; H vale para todo
+   o chão visível. Área válida = pixels com resolução ≤ 3 cm/px, alcance ≤ 3 m do base_link,
+   à frente da borda e acima de 85% da altura da imagem. Gera `front_charuco_*.json`
+   (`image_space: undistorted`, `camera_matrix`, `dist_coeffs`) e a referência de montagem.
+3. **Conferência:** ≥ 6 cruzes novas (perto e longe obrigatórios), tolerância padrão 2 cm;
+   promove para `front_base_link_charuco_*.json` e atualiza o `parede.sh` (com backup).
+
+CAMERA_MEXEU: calibrações com `mount_reference` comparam a cada 2 s dois recortes do corpo do
+robô (cantos inferiores). Deslocamento > 3 px ou rotação ≥ 1° em 3 verificações seguidas
+suspende as medidas em metros (`perception_valid=false`); canto coberto = inconclusivo.
+Validado com fotos reais de 13/11 (a câmera foi reposicionada às ~21:25 daquele dia).

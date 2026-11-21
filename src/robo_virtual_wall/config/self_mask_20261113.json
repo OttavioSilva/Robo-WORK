@@ -1,0 +1,6 @@
+{
+  "image_size": [640, 480],
+  "polygons": [[[246, 150], [277, 150], [283, 153], [312, 153], [331, 185], [337, 224], [357, 255], [354, 293], [335, 326], [360, 479], [151, 479], [170, 387], [182, 348], [188, 294], [209, 250], [225, 216], [237, 183]]],
+  "reference_image": "raw-20261113-213026-837696.png",
+  "scope": "Fixed camera 640x480 and observed arm/gripper pose only. Excludes occluded ground as well as the robot. Not valid for arbitrary arm movement; remeasure after any camera/arm pose change."
+}

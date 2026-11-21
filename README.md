@@ -2,6 +2,14 @@
 
 Robô móvel omnidirecional com rodas mecanum, ROS 2 Jazzy, Nav2, LiDAR e IMU. Este repositório reúne o desenvolvimento operacional, as análises e o treinamento em simulação.
 
+## Câmera e paredes de fita da arena — 21/11/2026
+
+O [relatório de 21/11](entregas/camera_parede_virtual_20261121/RELATORIO.md) reúne a calibração da câmera, as medições e as [imagens das três rodadas](entregas/camera_parede_virtual_20261121/evidencias). O [pacote de visão](src/robo_virtual_wall), a [ferramenta de calibração](ferramentas/calibracao) e os [scripts da arena](workspaces/robo_jazzy_ws/ferramentas/subida_unica) estão nos respectivos diretórios de código.
+
+**A gravação e a recarga no mapa fixo `arena_11-11_1938` aguardam ensaio no robô.** O arquivo usa o nome do mapa, mas o carregador verifica apenas o frame. Mapas diferentes podem usar o mesmo frame `map`. No modo de prova, chamar manualmente o serviço `/tape_keepout/save` pode sobrescrever o arquivo.
+
+Na conferência posterior ao relatório, os 74 testes puros passaram. Nos três arquivos de testes ROS em domínios isolados, houve 2 aprovações, 2 falhas e 6 erros. Os casos afetados ainda preparavam três observações para um detector que passou a exigir cinco.
+
 ## Parede virtual por fita — 13/11/2026
 
 O funcionamento conferido no robô está separado em

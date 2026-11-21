@@ -8,7 +8,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     defaults = dict(width='640', height='480', fps='30.0', fourcc='MJPG',
                     preview_allow_resize='false', use_sim_time='false', device='/dev/video2', image_topic='', show_windows='false', calibrate='false',
-                    homography_file='', preview_homography_file='', roi_top='0.10', roi_bottom='0.85')
+                    homography_file='', preview_homography_file='', roi_top='0.10', roi_bottom='0.85', self_mask_file='', self_mask_mode='static')
     args = [DeclareLaunchArgument(k, default_value=v) for k, v in defaults.items()]
     params = {k: LaunchConfiguration(k) for k in defaults}
     for key in ('width', 'height'):

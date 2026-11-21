@@ -1,0 +1,86 @@
+{
+  "H": [
+    [
+      -0.00013344927062725948,
+      -0.002397160299996588,
+      1.5259657032927263
+    ],
+    [
+      -0.00309832513955344,
+      -1.3141716271982248e-05,
+      0.9228221107522768
+    ],
+    [
+      -0.00023248457129059486,
+      0.00626615363707738,
+      1.0
+    ]
+  ],
+  "frame_id": "virtual_wall_front",
+  "units": "m",
+  "image_space": "raw",
+  "validated": false,
+  "image_size": [
+    640,
+    480
+  ],
+  "valid_pixels": [
+    [
+      361.7799987792969,
+      231.4600067138672
+    ],
+    [
+      139.99000549316406,
+      233.4199981689453
+    ],
+    [
+      180.0,
+      137.0
+    ],
+    [
+      354.7300109863281,
+      137.72999572753906
+    ]
+  ],
+  "pixels": [
+    [
+      139.99,
+      233.42
+    ],
+    [
+      361.78,
+      231.46
+    ],
+    [
+      180.0,
+      137.0
+    ],
+    [
+      354.73,
+      137.73
+    ]
+  ],
+  "metres": [
+    [
+      0.39,
+      0.2
+    ],
+    [
+      0.39,
+      -0.085
+    ],
+    [
+      0.646,
+      0.2
+    ],
+    [
+      0.645,
+      -0.1
+    ]
+  ],
+  "source": "Camera repositioned 2026-11-13. User measured four cross centres from front white edge; x forward, y left. Raw capture raw-20261113-202517-004529.png. Pixel centres estimated from visible crosses; far-left centre manually estimated due to low contrast. Independent checks pending.",
+  "validation": {
+    "status": "pending_independent_checks",
+    "scope": "preview_only"
+  }
+}

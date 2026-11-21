@@ -1,6 +1,7 @@
 """Interactive point checks in the front-edge reference; never navigation data."""
 import numpy as np
 import cv2
+from .projection import to_ground
 
 
 def inspect_point(pixel, calibration, fitting_pixels=()):
@@ -12,7 +13,7 @@ def inspect_point(pixel, calibration, fitting_pixels=()):
         return None
     if cv2.pointPolygonTest(polygon,tuple(point),False) < 0:
         return None
-    h = matrix @ np.r_[point,1.]
+    h = to_ground(calibration, point)[0]
     if not np.isfinite(h).all() or abs(h[2]) < 1e-9:
         return None
     metres = h[:2]/h[2]

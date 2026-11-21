@@ -10,6 +10,7 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
@@ -20,6 +21,11 @@ from . import detector
 from .projection import load_calibration, project_observed_segment, preview_observation, resize_preview
 from .point_probe import inspect_point, measured_check
 from .stabilization import SegmentSmoother, PreviewDistanceFilter
+from .self_mask import SelfMask
+from .dynamic_self_mask import DynamicSelfMask
+from .visible_retirement import observed_ground
+from .camera import LatestFrameCamera
+from .mount_check import MountCheck
 
 
 class VirtualWall(Node):
@@ -31,10 +37,21 @@ class VirtualWall(Node):
                         image_topic='', camera_frame='camera_optical_frame',
                         hsv_file=str(Path.home() / 'Downloads/hsv_fita.json'),
                         homography_file='', preview_homography_file='', preview_allow_resize=False, max_range_m=3.0,
-                        roi_top=0.10, roi_bottom=0.85)
+                        roi_top=0.10, roi_bottom=0.85, self_mask_file='', self_mask_mode='static',
+                        # CAMERA_RECONEXAO_20261121
+                        v4l2_controls='', reconnect_after_s=2.0,
+                        use_driver_timestamp=True, max_driver_age_s=0.5)
         for key, value in defaults.items():
             self.declare_parameter(key, value)
         self.p = lambda key: self.get_parameter(key).value
+        # GARRA_MASCARA_20261113: exclude only measured robot silhouette.
+        if self.p('self_mask_mode') not in ('static', 'dynamic'):
+            raise ValueError('self_mask_mode must be static or dynamic')
+        if self.p('self_mask_mode') == 'dynamic' and not self.p('self_mask_file'):
+            raise ValueError('Dynamic gripper requires a measured reference configuration')
+        mask_class = DynamicSelfMask if self.p('self_mask_mode') == 'dynamic' else SelfMask
+        self.self_mask = (mask_class(Path(self.p('self_mask_file')).expanduser())
+                          if self.p('self_mask_file') else None)
         if self.p('calibrate') and not self.p('show_windows'):
             raise ValueError('calibrate requires show_windows=true')
         if not 0 <= self.p('roi_top') < self.p('roi_bottom') <= 1:
@@ -71,8 +88,21 @@ class VirtualWall(Node):
             preview_path = Path(self.p('preview_homography_file')).expanduser()
             self.preview = load_calibration(preview_path, preview=True)
             self.fitting_pixels = json.loads(preview_path.read_text()).get('pixels', [])
+        self.mount_check = None
+        self.mount_inconclusive_since = None
+        self.last_mount_check = 0.
         if self.p('homography_file'):
-            self.calibration = load_calibration(Path(self.p('homography_file')).expanduser())
+            homography_path = Path(self.p('homography_file')).expanduser()
+            self.calibration = load_calibration(homography_path)
+            # CAMERA_MEXEU_20261121: calibrations made with the ChArUco tool
+            # carry two robot-body patches; a moved camera suspends metres.
+            reference = json.loads(homography_path.read_text()).get('mount_reference')
+            if reference:
+                image = cv2.imread(str(homography_path.parent / reference['image']), cv2.IMREAD_GRAYSCALE)
+                if image is None:
+                    raise ValueError('Mount reference image missing: ' + reference['image'])
+                self.mount_check = MountCheck(image, reference['rects'])
+                self.get_logger().info('CAMERA_MEXEU: verificacao da montagem ativa')
         if self.p('show_windows'):
             cv2.namedWindow('camera', cv2.WINDOW_AUTOSIZE)
             cv2.setMouseCallback('camera', self.on_camera_click)
@@ -82,7 +112,11 @@ class VirtualWall(Node):
         self.mask_pub = self.create_publisher(Image, '~/mask', qos_profile_sensor_data)
         self.status_pub = self.create_publisher(String, '~/detections', 10)
         self.markers_pub = self.create_publisher(MarkerArray, '~/segments', 10)
-        self.cap = None
+        self.camera = None
+        self.last_sequence = 0
+        self.driver_ages = []
+        self.process_times = []
+        self.last_latency_log = time.monotonic()
         self.last_processed = 0.0
         self.segment_smoother = SegmentSmoother()
         self.preview_filter = PreviewDistanceFilter()
@@ -91,17 +125,14 @@ class VirtualWall(Node):
             self.create_subscription(Image, self.p('image_topic'), self.on_image,
                                      qos_profile_sensor_data)
         else:
-            self.cap = cv2.VideoCapture(self.p('device'), cv2.CAP_V4L2)
-            if not self.cap.isOpened():
-                self.cap.release()
-                raise RuntimeError('Cannot open V4L2 camera: ' + self.p('device'))
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.p('fourcc')))
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.p('width'))
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.p('height'))
-            self.cap.set(cv2.CAP_PROP_FPS, self.p('fps'))
-            self.get_logger().info('Negotiated camera: %.0fx%.0f %.1f FPS' % (
-                self.cap.get(cv2.CAP_PROP_FRAME_WIDTH), self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
-                self.cap.get(cv2.CAP_PROP_FPS)))
+            # CAMERA_RECONEXAO_20261121: reader thread keeps only the newest
+            # frame and reopens the device after loss, without restarting
+            # tape_keepout (its confirmed walls live only in memory).
+            logger = self.get_logger()
+            log = dict(info=logger.info, warn=logger.warning, error=logger.error)
+            self.camera = LatestFrameCamera(self.p('device'), self.p('width'), self.p('height'),
+                self.p('fps'), self.p('fourcc'), self.p('v4l2_controls'),
+                self.p('reconnect_after_s'), log=log)
             self.create_timer(1.0 / self.p('processing_hz'), self.capture)
         self.get_logger().info('Observation only; metric projection: %s' % bool(self.calibration))
 
@@ -155,14 +186,35 @@ class VirtualWall(Node):
             self.markers_pub.publish(MarkerArray(markers=[clear]))
 
     def capture(self):
-        ok, frame = self.cap.read()
-        if not ok:
-            self.get_logger().warning('Camera read failed', throttle_duration_sec=5.0)
+        item = self.camera.latest(self.last_sequence)
+        if item is None:
             return
+        frame, read_time, driver_age, self.last_sequence = item
+        # Stamp at acquisition, not at processing. The V4L2 buffer time is
+        # used only when plausible (driver on CLOCK_MONOTONIC, small age).
+        delay = time.monotonic() - read_time
+        if self.p('use_driver_timestamp') and driver_age is not None:
+            if 0. <= driver_age <= self.p('max_driver_age_s'):
+                delay += driver_age
+                self.driver_ages.append(driver_age)
+            else:
+                self.get_logger().warning('Timestamp do driver implausivel (%.3f s); usando hora '
+                                          'da leitura' % driver_age, throttle_duration_sec=30.)
         header = Image().header
-        header.stamp = self.get_clock().now().to_msg()
+        header.stamp = (self.get_clock().now() - Duration(nanoseconds=int(delay * 1e9))).to_msg()
         header.frame_id = self.p('camera_frame')
+        started = time.monotonic()
         self.process(frame, header)
+        self.process_times.append(time.monotonic() - started)
+        if started - self.last_latency_log >= 10.:
+            ages = np.asarray(self.driver_ages or [np.nan]) * 1000
+            times = np.asarray(self.process_times or [np.nan]) * 1000
+            self.get_logger().info('CAMERA_LATENCIA: idade no driver mediana %.0f ms p90 %.0f ms; '
+                'processamento mediana %.0f ms p90 %.0f ms; %d quadros em %.0f s' % (
+                np.median(ages), np.percentile(ages, 90), np.median(times),
+                np.percentile(times, 90), len(times), started - self.last_latency_log))
+            self.driver_ages, self.process_times = [], []
+            self.last_latency_log = started
 
     def on_image(self, message):
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -182,14 +234,60 @@ class VirtualWall(Node):
         if self.p('calibrate'):
             for key in self.hsv:
                 self.hsv[key] = cv2.getTrackbarPos(key, 'ajuste HSV')
-        mask, hsv = detector.mascara_fita(frame, self.hsv)
+        perception_valid = True
+        if self.mount_check is not None:
+            now = time.monotonic()
+            if now - self.last_mount_check >= 2.:
+                self.last_mount_check = now
+                was_moved = self.mount_check.moved
+                moved = self.mount_check.update(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                if moved != was_moved:
+                    if moved:
+                        self.get_logger().error('CAMERA_MEXEU: camera deslocada desde a calibracao %s; '
+                            'medidas em metros SUSPENSAS ate recalibrar ou voltar a posicao'
+                            % self.mount_check.last)
+                    else:
+                        self.get_logger().info('CAMERA_MEXEU: montagem de volta a referencia; medidas retomadas')
+                if self.mount_check.last['state'] == 'inconclusive':
+                    if self.mount_inconclusive_since is None:
+                        self.mount_inconclusive_since = now
+                    elif now - self.mount_inconclusive_since > 60.:
+                        self.get_logger().warning('CAMERA_MEXEU: verificacao inconclusiva ha mais de 60 s '
+                            '(cantos inferiores cobertos?) %s' % self.mount_check.last,
+                            throttle_duration_sec=60.)
+                else:
+                    self.mount_inconclusive_since = None
+            if self.mount_check.moved:
+                perception_valid = False
+        if isinstance(self.self_mask, DynamicSelfMask):
+            previously_valid = self.self_mask.valid
+            gripper_valid = self.self_mask.update(frame)
+            # Both must hold: a tracked gripper does not cancel a moved camera.
+            perception_valid = perception_valid and gripper_valid
+            if gripper_valid != previously_valid:
+                if gripper_valid:
+                    self.get_logger().info('GARRA_DINAMICA: partes reconhecidas; observacoes habilitadas')
+                else:
+                    self.get_logger().warning('GARRA_DINAMICA: rastreio perdido; observacoes suspensas')
+        detection_frame = self.self_mask.erase(frame) if self.self_mask else frame
+        mask, hsv = detector.mascara_fita(detection_frame, self.hsv)
+        if self.self_mask:
+            mask, hsv = self.self_mask.erase(mask), self.self_mask.erase(hsv)
         mask[int(height * self.p('roi_bottom')):, :] = 0
         united = detector.unir_tracejado(mask)
         # Closing must not reintroduce excluded rows.
         united[:int(height * self.p('roi_top')), :] = 0
         united[int(height * self.p('roi_bottom')):, :] = 0
+        if self.self_mask:
+            united = self.self_mask.erase(united)
         annotated = frame.copy()
         walls = detector.detectar_paredes(united, mask, hsv, annotated)
+        if not perception_valid:
+            walls = []
+            self.segment_smoother.update([])
+        if self.self_mask:
+            walls = self.self_mask.visible_segments(walls)
+            self.self_mask.draw(annotated)
         # Smooth only the display. Published measurements retain current pixels.
         display_walls = self.segment_smoother.update(walls)
         for p1, p2, _ in display_walls:
@@ -223,10 +321,21 @@ class VirtualWall(Node):
                     markers.markers.append(marker)
             output.append(entry)
         self.markers_pub.publish(markers)
+        ground_view = None
+        if self.calibration and perception_valid and self.self_mask is None:
+            support = observed_ground(frame, self.calibration, self.p('roi_top'),
+                                      self.p('roi_bottom'), self.p('max_range_m'))
+            if support is not None:
+                ground_view = support.tolist()
         status = String()
         status.data = json.dumps(dict(observation_only=True,
             stamp=dict(sec=header.stamp.sec, nanosec=header.stamp.nanosec),
-            image_size=[width, height], metric_frame='base_link' if self.calibration else '',
+            image_size=[width, height], metric_frame='base_link' if self.calibration and perception_valid else '',
+            perception_valid=perception_valid,
+            mount_check=(self.mount_check.last if self.mount_check is not None else None),
+            observed_ground_base_link_m=ground_view,
+            self_mask=(self.self_mask.status if isinstance(self.self_mask, DynamicSelfMask)
+                       else dict(mode='static' if self.self_mask else 'none', valid=True)),
             detections=output))
         self.status_pub.publish(status)
         active_preview = self.preview
@@ -299,6 +408,9 @@ class VirtualWall(Node):
         else:
             text = self.probe_message or 'Clique: medir | M: trena | R: foto | botao direito: limpar'
         cv2.putText(annotated,text,(5,height-32),cv2.FONT_HERSHEY_SIMPLEX,.4,(0,255,255),1)
+        if self.mount_check is not None and self.mount_check.moved:
+            cv2.putText(annotated, 'CAMERA MEXEU: metros suspensos - recalibrar', (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 0, 255), 2)
         cv2.putText(annotated, 'Fitas aceitas: %d' % len(walls), (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         for image, encoding, publisher in [(annotated, 'bgr8', self.annotated),
@@ -335,6 +447,9 @@ class VirtualWall(Node):
                 if cv2.imwrite(str(path), frame):
                     path.with_suffix('.json').write_text(json.dumps(dict(
                         hsv=self.hsv, clicked_point=self.probe_selection, image_size=[width, height],
+                        self_mask_mode=self.p('self_mask_mode'),
+                        self_mask_file=self.p('self_mask_file'),
+                        tracking=(self.self_mask.status if isinstance(self.self_mask, DynamicSelfMask) else None),
                         fourcc=self.p('fourcc'), roi_top=self.p('roi_top'),
                         roi_bottom=self.p('roi_bottom')), indent=2), encoding='utf-8')
                     self.get_logger().info('Imagem original salva: %s' % path)
@@ -360,8 +475,8 @@ class VirtualWall(Node):
                 rclpy.try_shutdown()
 
     def destroy_node(self):
-        if self.cap is not None:
-            self.cap.release()
+        if self.camera is not None:
+            self.camera.close()
         if self.p('show_windows'):
             cv2.destroyAllWindows()
         super().destroy_node()
