@@ -1,0 +1,11 @@
+# SUPERVISOR_PASSAGEM_20261111. Coordenadas no frame map do posegraph selecionado.
+# Vazio intencionalmente: nao inventar coordenadas a partir de goals de bancadas.
+# Aplicar exige cadastro medido; observar registra candidatos do detector existente.
+# Exemplo de esquema (nao e coordenada de producao):
+# regioes:
+#   - id: corredor_norte
+#     entrada: [x, y]
+#     saida: [x, y]
+#     largura: 0.82
+#     tolerancia: 0.20
+regioes: []

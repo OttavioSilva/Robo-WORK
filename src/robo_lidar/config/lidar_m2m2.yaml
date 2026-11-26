@@ -1,0 +1,18 @@
+# LIDAR_M2M2 (24/11): filtro para o Slamtec Mapper M2M2 (ponte m2m2_bridge -> /scan_raw).
+# - invert_angles false: o M2M2 ja publica anti-horario (o Delta-2D precisava inverter)
+# - sem cortes de chao (CHAO_TRASEIRO/LADOS/ESQUERDA eram do Delta-2D): raio completo
+# - filtro do corpo mantido (mesma montagem x=0,33 y=0,005)
+scan_filter:
+  ros__parameters:
+    input_topic: /scan_raw
+    output_topic: /scan_front
+    invert_angles: false
+    blocked_intervals_deg: ""
+    body_filter_enabled: true
+    body_laser_x: 0.350  # LIDAR_POS_M2M2 (25/11): era 0.330
+    body_laser_y: 0.000  # LIDAR_POS_M2M2 (25/11): era 0.005
+    body_laser_yaw: 0.0
+    force_out_of_range_to_inf: true
+    floor_filter_enabled: false
+    floor_side_enabled: false
+    use_sim_time: false

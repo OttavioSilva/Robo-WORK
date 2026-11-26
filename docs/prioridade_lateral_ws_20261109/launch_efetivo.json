@@ -1,0 +1,69 @@
+{
+  "launch_instalado": "/home/marcos/robo_jazzy_ws/src/robo_navigation/launch/navigation.launch.py",
+  "modo": "lateral",
+  "processos": [
+    [
+      "python3",
+      "/home/marcos/robo_jazzy_ws/src/robo_navigation/scripts/filtro_corpo_scan.py"
+    ],
+    [
+      "python3",
+      "/home/marcos/robo_jazzy_ws/src/robo_navigation/scripts/destravar_node.py"
+    ],
+    [
+      "python3",
+      "/home/marcos/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py",
+      "--ros-args",
+      "-p",
+      "modo_curva_t:=lateral",
+      "-p",
+      "limite_vel_angular_real_t:=-1.0",
+      "-p",
+      "limite_vel_linear_real_t:=-1.0"
+    ],
+    [
+      "python3",
+      "/home/marcos/robo_jazzy_ws/src/robo_navigation/scripts/suavizador_nav.py"
+    ]
+  ],
+  "nos": {
+    "nav2_velocity_smoother": {
+      "remaps": [
+        [
+          "/tf",
+          "tf"
+        ],
+        [
+          "/tf_static",
+          "tf_static"
+        ],
+        [
+          "cmd_vel",
+          "cmd_vel_nav"
+        ]
+      ],
+      "parametros": [
+        "/home/marcos/robo_jazzy_ws/install/robo_navigation/share/robo_navigation/config/nav2_params.yaml",
+        "{'use_sim_time': False}"
+      ]
+    },
+    "nav2_collision_monitor": {
+      "remaps": [
+        [
+          "/tf",
+          "tf"
+        ],
+        [
+          "/tf_static",
+          "tf_static"
+        ]
+      ],
+      "parametros": [
+        "/home/marcos/robo_jazzy_ws/install/robo_navigation/share/robo_navigation/config/nav2_params.yaml",
+        "{'use_sim_time': False}",
+        "{'stop_pub_timeout': 2.0, 'SweptTurnStop.enabled': False}"
+      ]
+    }
+  },
+  "giro_frontal_recusado": true
+}

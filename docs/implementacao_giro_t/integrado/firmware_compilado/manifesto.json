@@ -1,0 +1,12 @@
+{
+  "source_sha256": "92cc20204cb1db7669f8984daabea8b71cb7a1e4b676b984c190e99834f79e12",
+  "sliding_header_sha256": "46544567646a7467010b3ae0532308dcd926ecbcedc52f360bc2e9942f842cf6",
+  "uploaded": false,
+  "board": "atmega2560",
+  "F_CPU": 16000000,
+  "git_head": "72013674bd5b00a5e1509b4c4fb7592362c2d1da",
+  "artifacts": {
+    "mega_mecanum_temporal.elf": "c0713be829ac55856f021961653984501b4adc9671b8321061de50bfe8e53ffa",
+    "mega_mecanum_temporal.hex": "42996fd57dfcb815d4fe2845780f5e7cb8e3a3ac07db8bdc178f272bef807b86"
+  }
+}

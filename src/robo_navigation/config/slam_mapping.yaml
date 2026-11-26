@@ -12,7 +12,7 @@ slam_toolbox:
     odom_frame: odom
     map_frame: map
     base_frame: base_link
-    scan_topic: /scan_front
+    scan_topic: /scan_slam  # SEM_MAPA_NO_GIRO 23/11: era /scan_front (scan_sem_giro.py corta o giro)
     mode: mapping
 
     # O mapa sera salvo depois com map_saver_cli.
@@ -23,12 +23,14 @@ slam_toolbox:
     # O Delta-2D publica aproximadamente 6,4 varreduras por segundo.
     throttle_scans: 1
     minimum_time_interval: 0.15
-    max_laser_range: 5.8
+    max_laser_range: 1.7  # LIMITE_17 (26/11): era 5.8; na frente o chao aparece alem disso (alem = livre, sem parede)
+    occupancy_threshold: 0.18  # SLAM_RAPIDO (24/11): era 0.25 (CONFIRMA 23/11; antes 0.1)
+    min_pass_through: 3  # CONFIRMA 23/11: era 2 (padrao)
     transform_publish_period: 0.02
     transform_timeout: 0.3
     restamp_tf: true
     tf_buffer_duration: 30.0
-    map_update_interval: 2.0
+    map_update_interval: 1.0  # SLAM_RAPIDO (24/11): era 2.0
     resolution: 0.05
     stack_size_to_use: 40000000
 
@@ -58,10 +60,10 @@ slam_toolbox:
     loop_search_space_resolution: 0.05
     loop_search_space_smear_deviation: 0.03
     distance_variance_penalty: 0.5
-    angle_variance_penalty: 1.0
+    angle_variance_penalty: 0.1  # SLAM_IMU_FORTE 23/11: era 1.0
     fine_search_angle_offset: 0.00349
-    coarse_search_angle_offset: 0.349
+    coarse_search_angle_offset: 0.0873  # SLAM_IMU_FORTE 23/11: era 0.349
     coarse_angle_resolution: 0.0349
-    minimum_angle_penalty: 0.9
+    minimum_angle_penalty: 0.2  # SLAM_IMU_FORTE 23/11: era 0.9
     minimum_distance_penalty: 0.5
     use_response_expansion: true

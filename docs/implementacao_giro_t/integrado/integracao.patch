@@ -1,0 +1,3975 @@
+--- a/ferramentas/gravar_teste.sh
++++ b/ferramentas/gravar_teste.sh
+@@ -1,38 +1,6 @@
+-#!/bin/bash
+-# Uso: ~/gravar_teste.sh nome_do_teste "descrição opcional"
++#!/usr/bin/env bash
++# Compatibilidade: ~/gravar_teste.sh nome "descricao" [--duration segundos]
++set -e
+ source /opt/ros/jazzy/setup.bash
+-source ~/robo_jazzy_ws/install/setup.bash
+-NOME=${1:-teste}
+-DESC=${2:-}
+-PASTA=~/bags/${NOME}_$(date +%Y%m%d_%H%M%S)
+-mkdir -p "$PASTA/ros_logs"
+-{ echo "teste: $NOME"; echo "descricao: $DESC"; echo "inicio: $(date '+%F %T')"; } > "$PASTA/notas.txt"
+-
+-echo ">>> Salvando os parâmetros em uso..."
+-for n in controller_server planner_server bt_navigator behavior_server smoother_server velocity_smoother collision_monitor slam_toolbox local_costmap/local_costmap global_costmap/global_costmap; do
+-  f="$PASTA/params_$(echo $n | tr '/' '_').yaml"
+-  if timeout 15 ros2 param dump /$n > "$f" 2>/dev/null && [ -s "$f" ]; then echo "   ok: $n"; else rm -f "$f"; echo "   não ativo: $n"; fi
+-done
+-
+-TOPICOS=(
+-  /rosout /tf /tf_static /scan_front /scan_raw /odom /imu/data /map /diagnostics
+-  /plan /plan_smoothed /local_plan /transformed_global_plan /evaluation
+-  /cmd_vel_nav /cmd_vel_smoothed /cmd_vel /collision_monitor_state
+-  /local_costmap/costmap /local_costmap/costmap_updates /local_costmap/published_footprint
+-  /global_costmap/costmap /global_costmap/costmap_updates
+-  /goal_pose /clicked_point /behavior_tree_log
+-  /navigate_to_pose/_action/status /navigate_to_pose/_action/feedback
+-  /follow_path/_action/status /compute_path_to_pose/_action/status
+-  /spin/_action/status /backup/_action/status
+-)
+-
+-trap ':' INT
+-echo ">>> GRAVANDO em $PASTA/bag  —  aperte Ctrl+C para parar."
+-ros2 bag record --include-hidden-topics --compression-mode file --compression-format zstd \
+-  -o "$PASTA/bag" "${TOPICOS[@]}"
+-
+-echo "fim: $(date '+%F %T')" >> "$PASTA/notas.txt"
+-cp -r /dev/shm/robo_ros_logs_* "$PASTA/ros_logs/" 2>/dev/null
+-tar -czf "$PASTA.tar.gz" -C ~/bags "$(basename "$PASTA")"
+-echo ">>> Teste salvo em: $PASTA"
+-echo ">>> Arquivo único para enviar: $PASTA.tar.gz ($(du -h "$PASTA.tar.gz" | cut -f1))"
++source "$HOME/robo_jazzy_ws/install/setup.bash"
++exec python3 "$HOME/robo_jazzy_ws/ferramentas/gravar_teste.py" "$@"
+diff --git a/ferramentas/gravar_teste.py b/ferramentas/gravar_teste.py
+new file mode 100755
+index 0000000..fac20ad
+--- /dev/null
++++ b/ferramentas/gravar_teste.py
+@@ -0,0 +1,221 @@
++#!/usr/bin/env python3
++"""Gravacao completa e preservacao de evidencias. Nunca publica velocidade."""
++import argparse
++import datetime as dt
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import shutil
++import signal
++import subprocess
++import tarfile
++import threading
++import time
++
++WORKSPACE = Path(__file__).resolve().parents[1]
++IMPORTANT = ['/scan_raw', '/scan_front', '/scan_nav', '/scan_raw_temporal',
++             '/scan_temporal_front', '/imu/data', '/imu/data_temporal', '/odom',
++             '/tf', '/tf_static', '/map', '/map_updates', '/plan', '/local_plan',
++             '/cmd_vel_ctrl', '/cmd_vel_nav', '/cmd_vel_nav_t', '/cmd_vel_nav_seguro',
++             '/cmd_vel_smoothed', '/cmd_vel', '/cmd_vel_hardware', '/hardware/tx_frames', '/hardware/serial_rx', '/hardware/lidar_packets', '/collision_monitor_state',
++             '/arbitro_t/estado', '/alinhador/estado_t', '/hardware/sensor_timing',
++             '/teste/trajetoria_estimada', '/local_costmap/costmap',
++             '/local_costmap/costmap_raw', '/local_costmap/costmap_updates',
++             '/global_costmap/costmap', '/global_costmap/costmap_raw',
++             '/global_costmap/costmap_updates', '/parameter_events', '/rosout']
++
++
++def capture(args, target, timeout=8, cwd=None):
++    try:
++        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                           timeout=timeout, cwd=cwd, check=False)
++        target.write_bytes(r.stdout)
++        return r.returncode
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        target.write_text(str(exc)+'\n')
++        return -1
++
++
++def snapshot_sources(folder):
++    dest = folder/'fontes'
++    dest.mkdir()
++    for key, args in {'status':['status','--porcelain=v1'], 'head':['rev-parse','HEAD'],
++                      'diff':['diff','--binary'], 'staged':['diff','--cached','--binary'],
++                      'untracked':['ls-files','--others','--exclude-standard'],
++                      'ultimo_commit':['log','-1','--format=fuller']}.items():
++        capture(['git', *args], dest/(key+'.txt'), cwd=WORKSPACE)
++    with tarfile.open(dest/'workspace_fontes.tar.gz', 'w:gz') as tar:
++        for name in ('src', 'firmware', 'ferramentas', 'docs', 'scripts'):
++            p = WORKSPACE/name
++            if p.exists():
++                tar.add(p, arcname=name, filter=lambda i: None if '__pycache__' in i.name else i)
++    firmware = Path.home()/'Arduino/workotvio/workotvio.ino'
++    if firmware.exists():
++        shutil.copy2(firmware, dest/'workotvio_fonte_disponivel.ino')
++    binaries = {}
++    candidate = WORKSPACE/'install/robo_hardware/lib/robo_hardware/hardware_bridge_node'
++    if candidate.exists():
++        binaries['instalado'] = dict(path=str(candidate.resolve()),
++                                    sha256=hashlib.sha256(candidate.read_bytes()).hexdigest())
++    for proc in Path('/proc').iterdir():
++        if not proc.name.isdigit():
++            continue
++        try:
++            if (proc/'comm').read_text().strip().startswith('hardware_bridge'):
++                binaries[proc.name] = dict(path=os.readlink(proc/'exe'),
++                    sha256=hashlib.sha256((proc/'exe').read_bytes()).hexdigest())
++        except (OSError,PermissionError):
++            pass
++    (dest/'binarios.json').write_text(json.dumps(binaries, indent=2))
++    wrapper = Path.home()/'gravar_teste.sh'
++    if wrapper.exists():
++        shutil.copy2(wrapper, dest/'gravar_teste_home.sh')
++    (dest/'sha256.json').write_text(json.dumps({p.name:hashlib.sha256(p.read_bytes()).hexdigest()
++        for p in dest.iterdir() if p.is_file()}, indent=2))
++
++
++def snapshot_ros(folder, phase, offline=False):
++    dest = folder/phase
++    dest.mkdir()
++    if offline:
++        (dest/'SIMULADO.txt').write_text('Teste do gravador; nenhum no ROS iniciado.\n')
++        return
++    capture(['ros2','node','list','--no-daemon'], dest/'nodes.txt')
++    capture(['ros2','topic','list','--include-hidden-topics','-t','--no-daemon'], dest/'topics.txt')
++    capture(['ros2','action','list','-t'], dest/'actions.txt')
++    capture(['ros2','service','list','-t'], dest/'services.txt')
++    capture(['ps','-eo','pid,args'], dest/'processos.txt')
++    errors = {}
++    for node in sorted(set((dest/'nodes.txt').read_text().splitlines())):
++        if not re.fullmatch(r'/[A-Za-z0-9_/]+', node):
++            continue
++        name = node.replace('/','_')
++        errors[node] = capture(['ros2','param','dump',node], dest/(name+'.yaml'), timeout=5)
++        capture(['ros2','node','info',node], dest/(name+'.node.txt'), timeout=5)
++    for topic in IMPORTANT:
++        capture(['ros2','topic','info','-v',topic],
++                dest/(topic.replace('/','_')+'.topic.txt'), timeout=3)
++    (dest/'erros_consulta.json').write_text(json.dumps(errors, indent=2))
++
++
++def package(folder):
++    archive = folder.with_suffix('.tar.gz')
++    # Nao remover nem recomprimir o bag bruto; pacote e copia adicional.
++    with tarfile.open(archive, 'w:gz') as tar:
++        tar.add(folder, arcname=folder.name)
++    digest=hashlib.sha256()
++    with archive.open('rb') as fp:
++        for chunk in iter(lambda:fp.read(1024*1024),b''):
++            digest.update(chunk)
++    archive.with_name(archive.name+'.sha256').write_text(digest.hexdigest()+'  '+archive.name+'\n')
++    return archive
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('nome', nargs='?', default='giro_t')
++    parser.add_argument('descricao', nargs='?', default='')
++    parser.add_argument('--base', type=Path, default=Path.home()/'bags')
++    parser.add_argument('--duration', type=float)
++    parser.add_argument('--offline-test', action='store_true', help='simula apenas o gravador; nao cria bag ROS real')
++    args = parser.parse_args(argv)
++    if args.duration is not None and (not 0 < args.duration < 86400):
++        parser.error('--duration precisa estar entre 0 e 86400 s')
++    name = re.sub(r'[^a-zA-Z0-9_-]', '_', args.nome)[:70] or 'teste'
++    args.base.mkdir(parents=True, exist_ok=True)
++    stamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
++    folder = args.base/(name+'_'+stamp)
++    folder.mkdir(exist_ok=False)
++    stop = threading.Event()
++    bag = trajectory = None
++    result = dict(nome=args.nome, descricao=args.descricao, inicio=dt.datetime.now().isoformat(),
++                  simulado=args.offline_test, workspace=str(WORKSPACE), topicos_criticos=IMPORTANT)
++    (folder/'manifesto.json').write_text(json.dumps(result, indent=2))
++    qos = WORKSPACE/'ferramentas/gravacao_qos.yaml'
++    shutil.copy2(qos, folder/'qos.yaml')
++    def stopping(*_):
++        stop.set()
++        if bag is not None and bag.poll() is None:
++            bag.send_signal(signal.SIGINT)
++    previous = {s:signal.signal(s, stopping) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
++    print('Gravacao:', folder, flush=True)
++    log = (folder/'gravador.log').open('w')
++    try:
++        snapshot_sources(folder)
++        if stop.is_set():
++            raise InterruptedError('interrompido antes de iniciar bag')
++        if args.offline_test:
++            (folder/'bag_simulado').mkdir()
++            (folder/'bag_simulado/NAO_E_UM_ROSBAG.txt').write_text('Somente teste do empacotamento.\n')
++        else:
++            cmd = ['ros2','bag','record','--all','--include-hidden-topics','--storage','mcap',
++                   '--qos-profile-overrides-path',str(qos),'-o',str(folder/'bag')]
++            result['comando_bag'] = cmd
++            bag = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
++            trajectory = subprocess.Popen(['python3',str(WORKSPACE/'ferramentas/trajetoria_teste.py')],
++                                           stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
++        start = time.monotonic()
++        snapshot_ros(folder, 'inicio', args.offline_test)
++        while not stop.wait(0.2):
++            if args.offline_test or (args.duration is not None and time.monotonic()-start >= args.duration):
++                break
++            if bag is not None and bag.poll() is not None:
++                result['erro'] = 'rosbag encerrou antes do solicitado'
++                break
++    except Exception as exc:
++        result['erro'] = repr(exc)
++    finally:
++        stopping()
++        for proc in (trajectory, bag):
++            if proc is not None:
++                if proc.poll() is None:
++                    proc.send_signal(signal.SIGINT)
++                try:
++                    proc.wait(timeout=20)
++                except subprocess.TimeoutExpired:
++                    proc.terminate()
++                    try:
++                        proc.wait(timeout=5)
++                    except subprocess.TimeoutExpired:
++                        proc.kill()
++                        proc.wait()
++                    result['erro'] = 'processo nao finalizou graciosamente; verifique integridade do bag'
++        result['retorno_bag'] = bag.returncode if bag else None
++        if bag is not None and bag.returncode not in (0, -signal.SIGINT, 130):
++            result['erro'] = 'rosbag terminou com erro: '+str(bag.returncode)
++        if not args.offline_test:
++            capture(['ros2','bag','info',str(folder/'bag')], folder/'bag_info.txt', timeout=15)
++            try:
++                import yaml
++                meta = yaml.safe_load((folder/'bag/metadata.yaml').read_text())['rosbag2_bagfile_information']
++                counts = {item['topic_metadata']['name']: item['message_count']
++                          for item in meta['topics_with_message_count']}
++                result['mensagens_por_topico'] = counts
++                result['ausentes_ou_sem_mensagens'] = [t for t in IMPORTANT if not counts.get(t,0)]
++            except Exception as exc:
++                result['erro_metadados_bag'] = str(exc)
++                result['erro'] = 'bag sem metadados legiveis; dados brutos preservados' 
++        snapshot_ros(folder, 'fim', args.offline_test)
++        logs = folder/'ros_logs'
++        logs.mkdir()
++        for root in [Path.home()/'.ros/log/latest', *Path('/dev/shm').glob('robo_ros_logs_*')]:
++            if root.exists():
++                try:
++                    shutil.copytree(root.resolve(), logs/root.name, dirs_exist_ok=True)
++                except OSError as exc:
++                    result.setdefault('erros_logs', []).append(str(exc))
++        result['fim'] = dt.datetime.now().isoformat()
++        (folder/'manifesto.json').write_text(json.dumps(result, indent=2))
++        log.close()
++        archive = package(folder)
++        for sig, handler in previous.items():
++            signal.signal(sig, handler)
++        print('Dados brutos preservados:', folder, flush=True)
++        print('Pacote:', archive, flush=True)
++    return 1 if result.get('erro') else 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/ferramentas/gravacao_qos.yaml b/ferramentas/gravacao_qos.yaml
+new file mode 100644
+index 0000000..513a39b
+--- /dev/null
++++ b/ferramentas/gravacao_qos.yaml
+@@ -0,0 +1,20 @@
++/tf_static:
++  durability: transient_local
++  reliability: reliable
++  history: keep_last
++  depth: 1
++/map:
++  durability: transient_local
++  reliability: reliable
++  history: keep_last
++  depth: 1
++/local_costmap/costmap:
++  durability: transient_local
++  reliability: reliable
++  history: keep_last
++  depth: 1
++/global_costmap/costmap:
++  durability: transient_local
++  reliability: reliable
++  history: keep_last
++  depth: 1
+diff --git a/ferramentas/trajetoria_teste.py b/ferramentas/trajetoria_teste.py
+new file mode 100644
+index 0000000..a34b4e9
+--- /dev/null
++++ b/ferramentas/trajetoria_teste.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""Somente observador: odom -> Path, sem qualquer publicador de velocidade."""
++from collections import deque
++
++
++def main():
++    import rclpy
++    from rclpy.node import Node
++    from nav_msgs.msg import Odometry, Path
++    from geometry_msgs.msg import PoseStamped
++    class Trajetoria(Node):
++        def __init__(self):
++            super().__init__('trajetoria_teste')
++            self.poses = deque(maxlen=20000)
++            self.ultimo = 0
++            self.frame = None
++            self.pub = self.create_publisher(Path, '/teste/trajetoria_estimada', 1)
++            self.create_subscription(Odometry, '/odom', self.ao_odom, 20)
++        def ao_odom(self, msg):
++            t = msg.header.stamp.sec*1000000000+msg.header.stamp.nanosec
++            if t-self.ultimo < 200000000 and t >= self.ultimo:
++                return
++            if self.frame != msg.header.frame_id or t < self.ultimo:
++                self.poses.clear()
++            self.frame, self.ultimo = msg.header.frame_id, t
++            p = PoseStamped()
++            p.header, p.pose = msg.header, msg.pose.pose
++            self.poses.append(p)
++            path = Path()
++            path.header, path.poses = msg.header, list(self.poses)
++            self.pub.publish(path)
++    rclpy.init()
++    n = Trajetoria()
++    try:
++        rclpy.spin(n)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        n.destroy_node()
++        rclpy.try_shutdown()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/ferramentas/verificar_giro_t.py b/ferramentas/verificar_giro_t.py
+new file mode 100755
+index 0000000..3675996
+--- /dev/null
++++ b/ferramentas/verificar_giro_t.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python3
++"""Preflight somente leitura; nunca publica comandos de movimento."""
++import argparse
++import json
++import math
++from pathlib import Path
++import sys
++import time
++
++sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src/robo_navigation/scripts'))
++from giro_frontal import avaliar_varredura, Observacao, envolve_disco
++
++
++def evaluate(data):
++    checks = dict(data.get('checks', {}))
++    checks['sensores_temporais_recentes'] = all(data.get('ages', {}).get(k, math.inf) <= 0.3
++        and data['ages'][k] >= 0 for k in ('scan', 'imu', 'odom'))
++    raw = data.get('scan')
++    checks['envelope_observado_livre'] = (raw is not None and
++        avaliar_varredura(raw['ranges'], raw['amin'], raw['inc'], raw['rmin'], raw['rmax'],
++                          tuple(data.get('laser', (0.330,0.005,0))),
++                          math.hypot(0.365,0.315)+0.05) is Observacao.LIVRE)
++    publishers = data.get('publishers', {})
++    expected = {'/cmd_vel_nav_seguro':'arbitro_t','/cmd_vel_nav_t':'alinhador_passagem',
++                '/cmd_vel_smoothed':'velocity_smoother','/cmd_vel':'collision_monitor'}
++    checks['cadeia_exclusiva'] = all(publishers.get(topic) == [node] for topic,node in expected.items())
++    checks['sensores_parados'] = (data.get('gyro_abs', math.inf) <= 0.03 and
++                                  data.get('linear_abs', math.inf) <= 0.01)
++    required = ['sensores_temporais_recentes','envelope_observado_livre','cadeia_exclusiva',
++                'sensores_parados','modo_experimental','cm_envelope','cm_ativo','smoother_ativo',
++                'hardware_timing_valido','limites_temporais_configurados', 'tf_laser_valida',
++                'arbitro_disponivel','saida_zero', 'arbitro_parado','sem_correcao_pos_cm','limites_de_movimento_configurados','autoridade_no_hardware']
++    ok = all(checks.get(k,False) for k in required)
++    return dict(parecer='APTO' if ok else 'NAO APTO', checks=checks,
++                pendencias=[k for k in required if not checks.get(k,False)])
++
++
++def main(argv=None):
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--seconds',type=float,default=5)
++    parser.add_argument('--snapshot',type=Path,help='JSON de simulacao; nao consulta ROS')
++    args=parser.parse_args(argv)
++    if args.snapshot:
++        data=json.loads(args.snapshot.read_text())
++        r=evaluate(data)
++        r['simulado']=True
++        print(json.dumps(r,indent=2))
++        return 0 if r['parecer']=='APTO' else 1
++    import rclpy
++    from rclpy.node import Node
++    from rclpy.qos import qos_profile_sensor_data
++    from rclpy.parameter_client import AsyncParameterClient
++    from rclpy.parameter import parameter_value_to_python
++    from lifecycle_msgs.srv import GetState
++    from sensor_msgs.msg import LaserScan, Imu
++    from nav_msgs.msg import Odometry
++    from geometry_msgs.msg import TwistStamped
++    from std_msgs.msg import String
++    from tf2_ros import Buffer, TransformListener
++    from rclpy.time import Time
++    rclpy.init()
++    node=Node('preflight_giro_t')
++    data={'ages':{}, 'checks':{}, 'publishers':{}}
++    received={}
++    def scan(msg):
++        received['scan']=msg.header.stamp
++        data['scan']=dict(ranges=list(msg.ranges),amin=msg.angle_min,inc=msg.angle_increment,
++                          rmin=msg.range_min,rmax=msg.range_max)
++    def imu(msg):
++        received['imu']=msg.header.stamp
++        data['gyro_abs']=abs(msg.angular_velocity.z)
++    def odom(msg):
++        received['odom']=msg.header.stamp
++        data['linear_abs']=math.hypot(msg.twist.twist.linear.x,msg.twist.twist.linear.y)
++    def timing(msg):
++        try:
++            item=json.loads(msg.data)
++            if not isinstance(item,dict): return
++            if item.get('valid'):
++                timing_seen[item['sensor']]=time.monotonic()
++            elif item.get('timed_frame'):
++                timing_seen[item['sensor']]=-math.inf
++        except (ValueError,KeyError):
++            pass
++    def state(msg):
++        try:
++            item=json.loads(msg.data)
++            if not isinstance(item,dict): return
++            data['checks']['arbitro_disponivel']=True
++            data['checks']['arbitro_parado']=not item['ativo'] and not item['falha']
++            received['arb_state_mono']=time.monotonic()
++        except (ValueError,KeyError):
++            pass
++    def command(msg):
++        tw=msg.twist
++        data['checks']['saida_zero']=all(abs(x)<1e-5 for x in (tw.linear.x,tw.linear.y,tw.angular.z))
++        received['cmd_mono']=time.monotonic()
++    node.create_subscription(LaserScan,'/scan_temporal_front',scan,qos_profile_sensor_data)
++    node.create_subscription(Imu,'/imu/data_temporal',imu,qos_profile_sensor_data)
++    node.create_subscription(Odometry,'/odom',odom,20)
++    node.create_subscription(String,'/hardware/sensor_timing',timing,20)
++    node.create_subscription(String,'/arbitro_t/estado',state,20)
++    node.create_subscription(TwistStamped,'/cmd_vel',command,20)
++    timing_seen={}
++    buffer=Buffer()
++    listener=TransformListener(buffer,node)
++    requested={
++        'alinhador_passagem':['modo_curva_t','limite_vel_angular_real_t','limite_vel_linear_real_t'],
++        'collision_monitor':['polygons','SweptTurnStop.enabled','SweptTurnStop.min_points',
++            'SweptTurnStop.left_turn.points','SweptTurnStop.right_turn.points'],
++        'robo_hardware':['temporal_enabled','device_clock_drift_bound_ppm',
++                         'lidar_capture_lag_bound_s','imu_capture_lag_bound_s','heading_hold_enabled','command_authority']}
++    futures={}
++    for name,keys in requested.items():
++        client=AsyncParameterClient(node,name)
++        futures[name]=(keys,client,client.get_parameters(keys))
++    lifecycle={}
++    for name in ('collision_monitor','velocity_smoother'):
++        client=node.create_client(GetState,'/'+name+'/get_state')
++        lifecycle[name]=(client,client.call_async(GetState.Request()))
++    end=time.monotonic()+max(1,args.seconds)
++    try:
++        while time.monotonic()<end:
++            rclpy.spin_once(node,timeout_sec=0.05)
++        for key in ('scan','imu','odom'):
++            stamp=received.get(key)
++            data['ages'][key]=((node.get_clock().now().nanoseconds-
++                stamp.sec*1000000000-stamp.nanosec)/1e9) if stamp else math.inf
++        for topic in ('/cmd_vel_nav_seguro','/cmd_vel_nav_t','/cmd_vel_smoothed','/cmd_vel'):
++            data['publishers'][topic]=[i.node_name for i in node.get_publishers_info_by_topic(topic)]
++        params={}
++        for name,(keys,client,f) in futures.items():
++            if f.done() and f.result() is not None:
++                params[name]=dict(zip(keys,[parameter_value_to_python(v) for v in f.result().values]))
++        a=params.get('alinhador_passagem',{})
++        cm=params.get('collision_monitor',{})
++        hw=params.get('robo_hardware',{})
++        data['checks']['modo_experimental']=a.get('modo_curva_t')=='giro_frontal'
++        data['checks']['limites_de_movimento_configurados']=(a.get('limite_vel_angular_real_t',-1)>=0.10
++            and a.get('limite_vel_linear_real_t',-1)>=0.03)
++        data['checks']['sem_correcao_pos_cm']=hw.get('heading_hold_enabled') is False
++        data['checks']['autoridade_no_hardware']=hw.get('command_authority')=='collision_monitor'
++        try:
++            geometria_cm = all(envolve_disco(json.loads(cm.get('SweptTurnStop.'+name+'.points','[]')),
++                math.hypot(.365,.315)+.05) for name in ('left_turn','right_turn'))
++        except (TypeError, ValueError):
++            geometria_cm = False
++        data['checks']['cm_envelope']=('SweptTurnStop' in cm.get('polygons',[]) and geometria_cm and
++            cm.get('SweptTurnStop.enabled') is True and cm.get('SweptTurnStop.min_points')==1)
++        data['checks']['limites_temporais_configurados']=(hw.get('temporal_enabled') is True and
++            all(math.isfinite(hw.get(k,-1)) and hw.get(k,-1)>=0 for k in
++                ('device_clock_drift_bound_ppm','lidar_capture_lag_bound_s','imu_capture_lag_bound_s')))
++        for name,key in [('collision_monitor','cm_ativo'),('velocity_smoother','smoother_ativo')]:
++            f=lifecycle[name][1]
++            data['checks'][key]=f.done() and f.result() is not None and f.result().current_state.id==3
++        data['checks']['hardware_timing_valido']=all(time.monotonic()-timing_seen.get(k,-math.inf)<=0.3 for k in ('lidar','imu'))
++        data['checks']['arbitro_disponivel']=time.monotonic()-received.get('arb_state_mono',-math.inf)<=0.3
++        data['checks']['saida_zero']=data['checks'].get('saida_zero',False) and time.monotonic()-received.get('cmd_mono',-math.inf)<=0.3
++        try:
++            tr=buffer.lookup_transform('base_link','laser_raw',Time())
++            q=tr.transform.rotation
++            yaw=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
++            data['laser']=[tr.transform.translation.x,tr.transform.translation.y,yaw]
++            data['checks']['tf_laser_valida']=True
++        except Exception:
++            data['checks']['tf_laser_valida']=False
++        r=evaluate(data)
++        print(json.dumps(r,indent=2,allow_nan=False))
++        return 0 if r['parecer']=='APTO' else 1
++    finally:
++        node.destroy_node()
++        rclpy.try_shutdown()
++
++
++if __name__=='__main__':
++    raise SystemExit(main())
+diff --git a/ferramentas/iniciar_teste_giro_t.sh b/ferramentas/iniciar_teste_giro_t.sh
+new file mode 100755
+index 0000000..3a1d2d1
+--- /dev/null
++++ b/ferramentas/iniciar_teste_giro_t.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++# Nao inicia navegacao nem habilita motor. Envia um goal apenas apos preflight.
++set -euo pipefail
++if [[ $# != 3 ]]; then
++  echo 'Uso: iniciar_teste_giro_t.sh X_DESTINO Y_DESTINO YAW_RAD' >&2
++  exit 2
++fi
++if [[ ${SUPERVISAO_GIRO_T:-} != CONFIRMADA ]]; then
++  echo 'Exige operador no E-stop e SUPERVISAO_GIRO_T=CONFIRMADA; nao habilita motores.' >&2
++  exit 2
++fi
++set +u
++source /opt/ros/jazzy/setup.bash
++source "$HOME/robo_jazzy_ws/install/setup.bash"
++set -u
++python3 "$HOME/robo_jazzy_ws/ferramentas/verificar_giro_t.py" --seconds 5
++payload=$(python3 - "$@" <<'PY'
++import json,math,sys
++x,y,yaw=map(float,sys.argv[1:])
++assert all(math.isfinite(v) for v in (x,y,yaw))
++print(json.dumps(dict(header=dict(frame_id='map'),pose=dict(position=dict(x=x,y=y,z=0.0),
++    orientation=dict(x=0.0,y=0.0,z=math.sin(yaw/2),w=math.cos(yaw/2))))))
++PY
++)
++ros2 topic pub --once /goal_pose_alinhado geometry_msgs/msg/PoseStamped "$payload"
+diff --git a/ferramentas/compilar_firmware_temporal.py b/ferramentas/compilar_firmware_temporal.py
+new file mode 100755
+index 0000000..0031830
+--- /dev/null
++++ b/ferramentas/compilar_firmware_temporal.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""Compila e linka firmware AVR local. Nao usa avrdude nem abre porta serial."""
++import argparse
++import os
++from pathlib import Path
++import subprocess
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--build-dir', type=Path, default=Path('/tmp/robo_firmware_temporal_build'))
++    args = parser.parse_args()
++    base = Path.home()/'.arduino15/packages/arduino'
++    core = sorted((base/'hardware/avr').glob('*'))[-1]
++    gcc = sorted((base/'tools/avr-gcc').glob('*/bin'))[-1]
++    libraries = Path.home()/'Arduino/libraries'
++    includes = [core/'cores/arduino', core/'variants/mega', core/'libraries/Wire/src',
++                core/'libraries/Wire/src/utility', core/'libraries/SPI/src',
++                *[libraries/n for n in ('Adafruit_BNO055','Adafruit_Unified_Sensor','Adafruit_BusIO')]]
++    flags = ['-Os','-ffunction-sections','-fdata-sections','-mmcu=atmega2560',
++             '-DF_CPU=16000000UL','-DARDUINO=10819','-DARDUINO_AVR_MEGA2560',
++             '-DARDUINO_ARCH_AVR', *[f'-I{p}' for p in includes]]
++    out = args.build_dir
++    out.mkdir(parents=True, exist_ok=True)
++    root = Path(__file__).resolve().parents[1]
++    sketch = root/'firmware/mega_mecanum_temporal/mega_mecanum_temporal.ino'
++    sources = [*list((core/'cores/arduino').glob('*.cpp')),
++               *list((core/'cores/arduino').glob('*.c')),
++               *list((core/'cores/arduino').glob('*.S')),
++               *list((core/'libraries/Wire/src').glob('*.cpp')),
++               core/'libraries/Wire/src/utility/twi.c', core/'libraries/SPI/src/SPI.cpp']
++    for lib in ('Adafruit_BNO055','Adafruit_Unified_Sensor','Adafruit_BusIO'):
++        sources += list((libraries/lib).glob('*.cpp'))
++    sources.append(sketch)
++    objects = []
++    for i, src in enumerate(sources):
++        obj = out/f'{i}_{src.stem}.o'
++        cpp = src.suffix in ('.cpp','.ino')
++        language = ['-x','c++','-std=gnu++11','-fno-exceptions','-fno-threadsafe-statics'] if cpp else []
++        compiler = gcc/('avr-g++' if cpp else 'avr-gcc')
++        subprocess.run([str(compiler),*flags,*language,'-c',str(src),'-o',str(obj)],check=True)
++        objects.append(str(obj))
++    elf = out/'mega_mecanum_temporal.elf'
++    subprocess.run([str(gcc/'avr-g++'),'-mmcu=atmega2560','-Wl,--gc-sections',
++                    *objects,'-lm','-o',str(elf)],check=True)
++    subprocess.run([str(gcc/'avr-objcopy'),'-O','ihex','-R','.eeprom',str(elf),str(elf.with_suffix('.hex'))],check=True)
++    subprocess.run([str(gcc/'avr-size'),str(elf)],check=True)
++    print('Compilado, sem upload:',elf.with_suffix('.hex'))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/ferramentas/restaurar_arquivos_integrado.py b/ferramentas/restaurar_arquivos_integrado.py
+new file mode 100644
+index 0000000..1acc354
+--- /dev/null
++++ b/ferramentas/restaurar_arquivos_integrado.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""Reversao explicita, sem Git reset/clean, preservando alteracoes posteriores."""
++import datetime as dt
++import hashlib
++import json
++from pathlib import Path
++import shutil
++import stat
++import tarfile
++
++
++def digest(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def safe_path(root, name):
++    p = root/name
++    if Path(name).is_absolute() or Path(name).parts[0] not in ('src','firmware','ferramentas','docs'):
++        raise ValueError('caminho nao permitido: '+name)
++    if not p.resolve().is_relative_to(root.resolve()) or p.is_symlink():
++        raise ValueError('caminho externo/symlink: '+name)
++    return p
++
++
++def restore(root, manifest, snapshot, wrapper, original_wrapper):
++    entries = manifest['modificados_existentes']+manifest['novos_codigo']
++    # Nao sobrescrever trabalho feito depois da entrega, nem mesmo no wrapper home.
++    for item in entries:
++        p = safe_path(root,item['path'])
++        if (not p.is_file() or digest(p)!=item['sha256'] or
++                ('mode' in item and stat.S_IMODE(p.stat().st_mode)!=item['mode'])):
++            raise RuntimeError('alteracao posterior detectada; revisar antes de restaurar: '+item['path'])
++    if wrapper.is_symlink() or digest(wrapper)!=manifest['wrapper_home_sha256']:
++        raise RuntimeError('wrapper home mudou depois da entrega; revisar antes de restaurar')
++    backup = root/'backups'/('reversao_integrado_'+dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
++    backup.mkdir(parents=True,exist_ok=False)
++    with tarfile.open(backup/'estado_antes_reversao.tar.gz','w:gz') as tar:
++        for item in entries:
++            tar.add(root/item['path'],arcname=item['path'])
++        tar.add(wrapper,arcname='gravar_teste_home.sh')
++    # Ler e validar o snapshot integralmente antes de tocar em fontes.
++    contents=[]
++    with tarfile.open(snapshot) as tar:
++        for item in manifest['modificados_existentes']:
++            m = tar.getmember(item['path'])
++            if not m.isfile(): raise ValueError('snapshot sem arquivo regular')
++            contents.append((safe_path(root,item['path']),tar.extractfile(m).read(),m.mode))
++    for p, content, mode in contents:
++        p.write_bytes(content)
++        p.chmod(mode & 0o777)
++    for item in manifest['novos_codigo']:
++        src=safe_path(root,item['path'])
++        dest=backup/'novos'/item['path']
++        dest.parent.mkdir(parents=True,exist_ok=True)
++        shutil.move(src,dest)  # preserva, nao apaga arquivos novos
++    shutil.copy2(original_wrapper,wrapper)
++    (backup/'resultado.json').write_text(json.dumps(manifest,indent=2))
++    return backup
++
++
++def main():
++    root=Path(__file__).resolve().parents[1]
++    manifest=json.loads((root/'docs/implementacao_giro_t/integrado/arquivos.json').read_text())
++    backup=restore(root,manifest,root/'backups/giro_integrado_20261109/antes.tar.gz',
++                   Path.home()/'gravar_teste.sh',root/'backups/giro_integrado_20261109/gravar_teste_home.sh')
++    print('Restaurado; todo estado posterior preservado em',backup)
++
++
++if __name__=='__main__':
++    main()
+diff --git a/firmware/mega_mecanum_temporal/mega_mecanum_temporal.ino b/firmware/mega_mecanum_temporal/mega_mecanum_temporal.ino
+new file mode 100644
+index 0000000..0b68f5e
+--- /dev/null
++++ b/firmware/mega_mecanum_temporal/mega_mecanum_temporal.ino
+@@ -0,0 +1,1449 @@
++// Variante temporal de workotvio, preservando protocolo/motores v2. NAO gravada automaticamente.
++#include <Arduino.h>
++#include "sliding_scan.h"
++#include <Wire.h>
++#include <Adafruit_Sensor.h>
++#include <Adafruit_BNO055.h>
++#include <utility/imumaths.h>
++#include <math.h>
++
++// Base mecanum + LiDAR Delta-2D + BNO055 para Arduino Mega 2560.
++// Projeto sem encoders. O BNO055 e somente sensor nesta etapa:
++// ele nao corrige os motores e nao interfere nas rotacoes pedidas pelo ROS 2.
++
++namespace Config {
++
++constexpr uint32_t USB_BAUD = 500000UL;
++constexpr uint32_t LIDAR_BAUD = 115200UL;
++
++constexpr uint8_t LIDAR_MOTOR_PWM_PIN = 44;
++constexpr uint8_t LIDAR_START_PWM = 255;
++constexpr uint8_t LIDAR_WORK_PWM = 200;
++constexpr uint32_t LIDAR_START_TIME_MS = 2000UL;
++
++constexpr int16_t MOTOR_MAX_PWM = 215;
++// O computador define o PWM minimo adequado para cada movimento. Isso permite
++// usar PWM 150 na translacao e um valor menor em uma rotacao intencional.
++constexpr float MOTOR_ACCEL_PWM_PER_S = 200.0F;
++constexpr float MOTOR_DECEL_PWM_PER_S = 600.0F;
++constexpr uint32_t MOTOR_UPDATE_MS = 5UL;
++constexpr uint32_t COMMAND_WATCHDOG_MS = 300UL;
++
++constexpr uint16_t LIDAR_MIN_MM = 80;
++constexpr uint16_t LIDAR_MAX_MM = 6000;
++constexpr uint16_t SCAN_BIN_COUNT = 180;
++constexpr float SCAN_BIN_DEG = 2.0F;
++constexpr uint16_t MIN_VALID_SCAN_BINS = 25;
++constexpr float SENSOR_FRONT_DEG = 270.0F;
++
++constexpr uint32_t STATUS_PERIOD_MS = 200UL;
++
++constexpr uint8_t BNO055_ADDRESS = 0x29;
++// 25 Hz e suficiente para a primeira integracao com robot_localization e
++// reduz o tempo bloqueado em transacoes I2C no Mega.
++constexpr uint32_t IMU_PERIOD_MS = 40UL;
++constexpr uint32_t IMU_CALIBRATION_PERIOD_MS = 500UL;
++
++}  // namespace Config
++
++struct MotorPins {
++  uint8_t forward_pwm;
++  uint8_t reverse_pwm;
++  bool inverted;
++};
++
++// Mapeamento e inversoes confirmados no teste BNO055 de 17/09/2026.
++// forward_pwm = RPWM; reverse_pwm = LPWM.
++// A inversao faz PWM logico positivo sempre representar avanco fisico da roda.
++constexpr MotorPins M1{12, 11, true};  // dianteira direita (FR)
++constexpr MotorPins M2{10, 9, false};  // dianteira esquerda (FL)
++constexpr MotorPins M3{8, 7, true};    // traseira direita (RR)
++constexpr MotorPins M4{6, 5, false};   // traseira esquerda (RL)
++
++namespace UsbProtocol {
++
++constexpr uint8_t SOF_1 = 0xA5;
++constexpr uint8_t SOF_2 = 0x5A;
++// A versao 2 impede que o bridge diferencial antigo comande este firmware.
++constexpr uint8_t VERSION = 0x02;
++
++constexpr uint8_t TYPE_MECANUM_COMMAND = 0x01;
++constexpr uint8_t TYPE_SCAN = 0x10;
++constexpr uint8_t TYPE_STATUS = 0x11;
++constexpr uint8_t TYPE_IMU = 0x12;
++constexpr uint8_t TYPE_SCAN_TIMED = 0x13;
++constexpr uint8_t TYPE_CLOCK_PROBE_REPLY = 0x14;
++constexpr uint8_t TYPE_IMU_TIMED = 0x15;
++constexpr uint8_t TYPE_LIDAR_PACKET = 0x16;
++constexpr uint8_t TYPE_CLOCK_PROBE = 0x02;
++
++constexpr uint8_t FLAG_ENABLE = 0x01;
++constexpr uint8_t FLAG_ESTOP = 0x02;
++
++// sequencia u16 + FL/FR/RL/RR i16 + flags u8
++constexpr uint16_t MECANUM_COMMAND_PAYLOAD_SIZE = 11;
++constexpr uint16_t MAX_RX_PAYLOAD_SIZE = 32;
++
++}  // namespace UsbProtocol
++
++namespace DeltaProtocol {
++
++constexpr uint8_t START_BYTE = 0xAA;
++constexpr uint8_t VERSION = 0x01;
++constexpr uint8_t PACKET_TYPE = 0x61;
++constexpr uint8_t DATA_RPM_AND_MEAS = 0xAD;
++constexpr uint8_t DATA_RPM_ONLY = 0xAE;
++constexpr uint16_t MIN_FRAME_SIZE = 11;
++constexpr uint16_t MAX_FRAME_SIZE = 160;
++constexpr uint16_t MAX_SAMPLE_COUNT =
++    (MAX_FRAME_SIZE - 15U) / 3U;
++constexpr uint8_t PACKETS_PER_SCAN = 16;
++constexpr uint32_t INTERBYTE_TIMEOUT_MS = 50UL;
++
++}  // namespace DeltaProtocol
++
++// ---------- Utilitarios binarios ----------
++
++uint16_t readU16LE(const uint8_t *data) {
++  return static_cast<uint16_t>(data[0]) |
++         (static_cast<uint16_t>(data[1]) << 8);
++}
++
++int16_t readI16LE(const uint8_t *data) {
++  return static_cast<int16_t>(readU16LE(data));
++}
++
++uint16_t readU16BE(const uint8_t *data) {
++  return (static_cast<uint16_t>(data[0]) << 8) |
++         static_cast<uint16_t>(data[1]);
++}
++
++uint16_t crc16CcittUpdate(uint16_t crc, uint8_t value) {
++  crc ^= static_cast<uint16_t>(value) << 8;
++  for (uint8_t bit = 0; bit < 8; ++bit) {
++    crc = (crc & 0x8000U) ? static_cast<uint16_t>((crc << 1) ^ 0x1021U)
++                          : static_cast<uint16_t>(crc << 1);
++  }
++  return crc;
++}
++
++// ---------- Fila USB TX nao bloqueante ----------
++
++constexpr uint16_t USB_TX_BUFFER_SIZE = 1024;
++uint8_t usb_tx_buffer[USB_TX_BUFFER_SIZE];
++uint16_t usb_tx_head = 0;
++uint16_t usb_tx_tail = 0;
++uint32_t usb_tx_dropped_frames = 0;
++
++uint16_t usbTxUsed() {
++  if (usb_tx_head >= usb_tx_tail) {
++    return usb_tx_head - usb_tx_tail;
++  }
++  return USB_TX_BUFFER_SIZE - (usb_tx_tail - usb_tx_head);
++}
++
++uint16_t usbTxFree() {
++  return USB_TX_BUFFER_SIZE - usbTxUsed() - 1;
++}
++
++void usbTxPush(uint8_t value) {
++  usb_tx_buffer[usb_tx_head] = value;
++  usb_tx_head = (usb_tx_head + 1U) % USB_TX_BUFFER_SIZE;
++}
++
++void usbFramePush(uint8_t value, uint16_t &crc) {
++  usbTxPush(value);
++  crc = crc16CcittUpdate(crc, value);
++}
++
++void usbFramePushU16(uint16_t value, uint16_t &crc) {
++  usbFramePush(static_cast<uint8_t>(value & 0xFFU), crc);
++  usbFramePush(static_cast<uint8_t>((value >> 8) & 0xFFU), crc);
++}
++
++void usbFramePushI16(int16_t value, uint16_t &crc) {
++  usbFramePushU16(static_cast<uint16_t>(value), crc);
++}
++
++void usbFramePushU32(uint32_t value, uint16_t &crc) {
++  usbFramePush(static_cast<uint8_t>(value & 0xFFUL), crc);
++  usbFramePush(static_cast<uint8_t>((value >> 8) & 0xFFUL), crc);
++  usbFramePush(static_cast<uint8_t>((value >> 16) & 0xFFUL), crc);
++  usbFramePush(static_cast<uint8_t>((value >> 24) & 0xFFUL), crc);
++}
++
++void usbFramePushI32(int32_t value, uint16_t &crc) {
++  usbFramePushU32(static_cast<uint32_t>(value), crc);
++}
++
++bool usbFrameBegin(uint8_t type, uint16_t payload_size, uint16_t &crc) {
++  const uint16_t total_size = 2U + 4U + payload_size + 2U;
++  if (usbTxFree() < total_size) {
++    ++usb_tx_dropped_frames;
++    return false;
++  }
++
++  usbTxPush(UsbProtocol::SOF_1);
++  usbTxPush(UsbProtocol::SOF_2);
++
++  crc = 0xFFFFU;
++  usbFramePush(UsbProtocol::VERSION, crc);
++  usbFramePush(type, crc);
++  usbFramePushU16(payload_size, crc);
++  return true;
++}
++
++void usbFrameEnd(uint16_t crc) {
++  usbTxPush(static_cast<uint8_t>(crc & 0xFFU));
++  usbTxPush(static_cast<uint8_t>((crc >> 8) & 0xFFU));
++}
++
++void serviceUsbTx() {
++  int writable = Serial.availableForWrite();
++  while (writable-- > 0 && usb_tx_tail != usb_tx_head) {
++    Serial.write(usb_tx_buffer[usb_tx_tail]);
++    usb_tx_tail = (usb_tx_tail + 1U) % USB_TX_BUFFER_SIZE;
++  }
++}
++
++// ---------- Controle dos motores ----------
++
++enum WheelIndex : uint8_t {
++  WHEEL_FL = 0,
++  WHEEL_FR = 1,
++  WHEEL_RL = 2,
++  WHEEL_RR = 3,
++  WHEEL_COUNT = 4
++};
++
++int16_t target_wheel_pwm[WHEEL_COUNT] = {0, 0, 0, 0};
++float current_wheel_pwm[WHEEL_COUNT] = {0.0F, 0.0F, 0.0F, 0.0F};
++bool command_received = false;
++bool watchdog_active = true;
++uint32_t last_valid_command_ms = 0;
++uint32_t last_motor_update_ms = 0;
++uint16_t last_command_sequence = 0;
++
++int16_t sanitizeRequestedPwm(int16_t value) {
++  if (value == 0) {
++    return 0;
++  }
++
++  int32_t magnitude = value;
++  const int16_t sign = magnitude < 0 ? -1 : 1;
++  if (magnitude < 0) {
++    magnitude = -magnitude;
++  }
++  if (magnitude > Config::MOTOR_MAX_PWM) {
++    magnitude = Config::MOTOR_MAX_PWM;
++  }
++  return static_cast<int16_t>(sign * magnitude);
++}
++
++void writeSingleMotor(const MotorPins &pins, int16_t signed_pwm) {
++  int16_t value = signed_pwm;
++  if (pins.inverted) {
++    value = -value;
++  }
++
++  const uint8_t magnitude = static_cast<uint8_t>(abs(value));
++  if (value > 0) {
++    analogWrite(pins.reverse_pwm, 0);
++    analogWrite(pins.forward_pwm, magnitude);
++  } else if (value < 0) {
++    analogWrite(pins.forward_pwm, 0);
++    analogWrite(pins.reverse_pwm, magnitude);
++  } else {
++    analogWrite(pins.forward_pwm, 0);
++    analogWrite(pins.reverse_pwm, 0);
++  }
++}
++
++void writeWheel(uint8_t wheel, int16_t pwm) {
++  switch (wheel) {
++    case WHEEL_FL:
++      writeSingleMotor(M2, pwm);
++      break;
++    case WHEEL_FR:
++      writeSingleMotor(M1, pwm);
++      break;
++    case WHEEL_RL:
++      writeSingleMotor(M4, pwm);
++      break;
++    case WHEEL_RR:
++      writeSingleMotor(M3, pwm);
++      break;
++  }
++}
++
++void stopDriveImmediately() {
++  for (uint8_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
++    target_wheel_pwm[wheel] = 0;
++    current_wheel_pwm[wheel] = 0.0F;
++    writeWheel(wheel, 0);
++  }
++}
++
++float stepMotorRamp(float current, int16_t requested, float elapsed_s) {
++  // Um comando zero significa parada. O corte imediato evita que a rampa de
++  // desaceleracao continue impulsionando o robo depois de atingir o alvo.
++  if (requested == 0) {
++    return 0.0F;
++  }
++
++  if (fabsf(current) < 0.5F) {
++    current = 0.0F;
++  }
++
++  // O bridge envia o PWM minimo apropriado para translacao ou rotacao.
++  // Todas as rodas partem juntas diretamente no valor solicitado.
++  if (current == 0.0F) {
++    return static_cast<float>(requested);
++  }
++
++  float effective_target = static_cast<float>(requested);
++  const bool reversing = (current > 0.0F && effective_target < 0.0F) ||
++                         (current < 0.0F && effective_target > 0.0F);
++  if (reversing) {
++    effective_target = 0.0F;
++  }
++
++  const bool decelerating = fabsf(effective_target) < fabsf(current);
++  const float rate = decelerating ? Config::MOTOR_DECEL_PWM_PER_S
++                                  : Config::MOTOR_ACCEL_PWM_PER_S;
++  const float maximum_step = rate * elapsed_s;
++
++  if (current < effective_target) {
++    current += maximum_step;
++    if (current > effective_target) {
++      current = effective_target;
++    }
++  } else if (current > effective_target) {
++    current -= maximum_step;
++    if (current < effective_target) {
++      current = effective_target;
++    }
++  }
++
++  if (fabsf(current) < 0.5F && effective_target == 0.0F) {
++    current = 0.0F;
++  }
++  return current;
++}
++
++void serviceMotors(uint32_t now_ms) {
++  if (command_received &&
++      static_cast<uint32_t>(now_ms - last_valid_command_ms) > Config::COMMAND_WATCHDOG_MS) {
++    watchdog_active = true;
++    command_received = false;
++    stopDriveImmediately();
++  }
++
++  const uint32_t elapsed_ms = now_ms - last_motor_update_ms;
++  if (elapsed_ms < Config::MOTOR_UPDATE_MS) {
++    return;
++  }
++  last_motor_update_ms = now_ms;
++
++  if (watchdog_active) {
++    stopDriveImmediately();
++    return;
++  }
++
++  const float elapsed_s = static_cast<float>(elapsed_ms) * 0.001F;
++  for (uint8_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
++    current_wheel_pwm[wheel] =
++        stepMotorRamp(current_wheel_pwm[wheel], target_wheel_pwm[wheel], elapsed_s);
++    writeWheel(wheel, static_cast<int16_t>(lroundf(current_wheel_pwm[wheel])));
++  }
++}
++
++// ---------- Parser de comandos USB ----------
++
++uint8_t usb_rx_buffer[4U + UsbProtocol::MAX_RX_PAYLOAD_SIZE + 2U];
++uint16_t usb_rx_index = 0;
++uint16_t usb_rx_expected = 0;
++bool usb_rx_receiving = false;
++bool usb_rx_saw_first_sof = false;
++uint32_t usb_rx_bad_frames = 0;
++
++void resetUsbRx() {
++  usb_rx_index = 0;
++  usb_rx_expected = 0;
++  usb_rx_receiving = false;
++}
++
++void applyMecanumCommand(const uint8_t *payload, uint32_t now_ms) {
++  const uint16_t sequence = readU16LE(payload);
++  const uint8_t flags = payload[10];
++
++  last_command_sequence = sequence;
++  last_valid_command_ms = now_ms;
++  command_received = true;
++
++  if ((flags & UsbProtocol::FLAG_ENABLE) == 0U ||
++      (flags & UsbProtocol::FLAG_ESTOP) != 0U) {
++    watchdog_active = true;
++    command_received = false;
++    stopDriveImmediately();
++    return;
++  }
++
++  for (uint8_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
++    target_wheel_pwm[wheel] = sanitizeRequestedPwm(
++        readI16LE(payload + 2U + static_cast<uint16_t>(wheel) * 2U));
++  }
++  watchdog_active = false;
++}
++
++uint32_t temporal_host_seen_ms = 0;
++bool temporalEnabled() {
++  return temporal_host_seen_ms && static_cast<uint32_t>(millis()-temporal_host_seen_ms) < 2000UL;
++}
++
++void processUsbRxFrame(uint32_t now_ms) {
++  const uint16_t payload_size = readU16LE(usb_rx_buffer + 2);
++  const uint16_t crc_offset = 4U + payload_size;
++  const uint16_t received_crc = readU16LE(usb_rx_buffer + crc_offset);
++
++  uint16_t calculated_crc = 0xFFFFU;
++  for (uint16_t i = 0; i < crc_offset; ++i) {
++    calculated_crc = crc16CcittUpdate(calculated_crc, usb_rx_buffer[i]);
++  }
++
++  if (received_crc != calculated_crc || usb_rx_buffer[0] != UsbProtocol::VERSION) {
++    ++usb_rx_bad_frames;
++    return;
++  }
++
++  if (usb_rx_buffer[1] == UsbProtocol::TYPE_CLOCK_PROBE && payload_size == 4U) {
++    temporal_host_seen_ms = millis();
++    const uint32_t observed_us = micros();
++    uint16_t crc = 0;
++    if (usbFrameBegin(UsbProtocol::TYPE_CLOCK_PROBE_REPLY, 8U, crc)) {
++      usbFramePushU32(readU16LE(usb_rx_buffer + 4) |
++        (static_cast<uint32_t>(readU16LE(usb_rx_buffer + 6)) << 16), crc);
++      usbFramePushU32(observed_us, crc);
++      usbFrameEnd(crc);
++    }
++    return;
++  }
++  if (usb_rx_buffer[1] == UsbProtocol::TYPE_MECANUM_COMMAND &&
++      payload_size == UsbProtocol::MECANUM_COMMAND_PAYLOAD_SIZE) {
++    applyMecanumCommand(usb_rx_buffer + 4, now_ms);
++  } else {
++    ++usb_rx_bad_frames;
++  }
++}
++
++void processUsbRxByte(uint8_t value, uint32_t now_ms) {
++  if (!usb_rx_receiving) {
++    if (!usb_rx_saw_first_sof) {
++      usb_rx_saw_first_sof = value == UsbProtocol::SOF_1;
++      return;
++    }
++
++    if (value == UsbProtocol::SOF_2) {
++      usb_rx_receiving = true;
++      usb_rx_saw_first_sof = false;
++      usb_rx_index = 0;
++      usb_rx_expected = 0;
++      return;
++    }
++
++    usb_rx_saw_first_sof = value == UsbProtocol::SOF_1;
++    return;
++  }
++
++  if (usb_rx_index >= sizeof(usb_rx_buffer)) {
++    ++usb_rx_bad_frames;
++    resetUsbRx();
++    return;
++  }
++
++  usb_rx_buffer[usb_rx_index++] = value;
++
++  if (usb_rx_index == 4U) {
++    const uint16_t payload_size = readU16LE(usb_rx_buffer + 2);
++    if (payload_size > UsbProtocol::MAX_RX_PAYLOAD_SIZE) {
++      ++usb_rx_bad_frames;
++      resetUsbRx();
++      return;
++    }
++    usb_rx_expected = 4U + payload_size + 2U;
++  }
++
++  if (usb_rx_expected != 0U && usb_rx_index == usb_rx_expected) {
++    processUsbRxFrame(now_ms);
++    resetUsbRx();
++  }
++}
++
++void serviceUsbRx(uint32_t now_ms) {
++  while (Serial.available() > 0) {
++    processUsbRxByte(static_cast<uint8_t>(Serial.read()), now_ms);
++  }
++}
++
++// ---------- Delta-2D e montagem da varredura ----------
++
++uint8_t lidar_frame[DeltaProtocol::MAX_FRAME_SIZE];
++uint16_t lidar_frame_index = 0;
++uint16_t lidar_expected_size = 0;
++uint32_t lidar_last_byte_ms = 0;
++
++SlidingScan180 temporal_scan;
++uint32_t temporal_last_snapshot_us = 0;
++uint8_t temporal_samples_min = 255, temporal_samples_max = 0, temporal_packet_count = 0;
++uint16_t scan_ranges_mm[Config::SCAN_BIN_COUNT];
++uint16_t scan_valid_bins = 0;
++uint16_t last_scan_valid_bins = 0;
++uint16_t scan_sequence = 0;
++uint32_t scan_started_us = 0;
++bool scan_active = false;
++float previous_packet_start_deg = 0.0F;
++bool have_previous_packet_angle = false;
++uint8_t lidar_scan_freq_x20 = 0;
++
++uint32_t lidar_good_packets = 0;
++uint32_t lidar_bad_checksums = 0;
++uint32_t lidar_bad_frames = 0;
++
++uint32_t lidar_bad_timeout = 0;
++uint32_t lidar_bad_size = 0;
++uint32_t lidar_bad_version = 0;
++uint32_t lidar_bad_packet_type = 0;
++uint32_t lidar_bad_measurement = 0;
++uint32_t lidar_bad_unknown_type = 0;
++uint32_t lidar_bad_overflow = 0;
++
++uint16_t lidar_max_serial2_available = 0;
++uint32_t max_loop_gap_us = 0;
++uint32_t last_loop_entry_us = 0;
++
++// Supervisao / auto-recuperacao do Delta-2D.
++uint32_t lidar_rx_bytes_total = 0;
++uint32_t lidar_last_rx_byte_ms = 0;
++uint32_t lidar_last_good_packet_ms = 0;
++uint32_t lidar_last_completed_scan_ms = 0;
++uint32_t lidar_last_recovery_ms = 0;
++
++uint32_t lidar_parser_recoveries = 0;
++uint32_t lidar_scan_recoveries = 0;
++uint32_t lidar_uart_recoveries = 0;
++
++bool lidar_seen_data = false;
++
++// Normalmente temos ~5.7 scans/s (~175 ms por volta).
++// Estes limites deixam margem ampla, mas tentam recuperar antes do
++// source_timeout=1.0 s usado pelo Collision Monitor.
++constexpr uint32_t LIDAR_PACKET_STALL_MS = 500UL;
++constexpr uint32_t LIDAR_SCAN_STALL_MS = 650UL;
++constexpr uint32_t LIDAR_UART_SILENCE_MS = 800UL;
++constexpr uint32_t LIDAR_RECOVERY_COOLDOWN_MS = 500UL;
++
++void clearScan() {
++  temporal_samples_min = 255;
++  temporal_samples_max = temporal_packet_count = 0;
++  for (uint16_t i = 0; i < Config::SCAN_BIN_COUNT; ++i) {
++    scan_ranges_mm[i] = 0;
++  }
++  scan_valid_bins = 0;
++}
++
++float normalizeAngle180(float angle_deg) {
++  while (angle_deg >= 180.0F) {
++    angle_deg -= 360.0F;
++  }
++  while (angle_deg < -180.0F) {
++    angle_deg += 360.0F;
++  }
++  return angle_deg;
++}
++
++void queueCompletedScan(uint32_t scan_time_us) {
++  last_scan_valid_bins = scan_valid_bins;
++  if (scan_valid_bins < Config::MIN_VALID_SCAN_BINS) {
++    return;
++  }
++
++  // O LiDAR conseguiu construir uma varredura completa e valida.
++  // Marcamos antes da fila USB para separar saude do sensor de eventual
++  // congestionamento na transmissao USB.
++  lidar_last_completed_scan_ms = millis();
++
++  constexpr uint16_t payload_size =
++      2U + 4U + 4U + 1U + 2U + (Config::SCAN_BIN_COUNT * 2U);
++  uint16_t crc = 0;
++  if (!usbFrameBegin(UsbProtocol::TYPE_SCAN, payload_size, crc)) {
++    return;
++  }
++
++  usbFramePushU16(scan_sequence++, crc);
++  usbFramePushU32(millis(), crc);
++  usbFramePushU32(scan_time_us, crc);
++  usbFramePush(lidar_scan_freq_x20, crc);
++  usbFramePushU16(scan_valid_bins, crc);
++  for (uint16_t i = 0; i < Config::SCAN_BIN_COUNT; ++i) {
++    usbFramePushU16(scan_ranges_mm[i], crc);
++  }
++  usbFrameEnd(crc);
++}
++
++// Envia uma janela completa de bins recentes a 40 Hz, independente da borda
++// da revolucao (~5,7 Hz). Cada bin conserva a sua captura; velho/sem eco e zero.
++// O quadro legado por revolucao continua inalterado para o caminho lateral.
++void queueTemporalSnapshot() {
++  const uint32_t now_us = micros();
++  if (static_cast<uint32_t>(now_us-temporal_last_snapshot_us) < 25000UL) return;
++  temporal_last_snapshot_us = now_us;
++  temporal_scan.expire(now_us);  // impede ressuscitar dado velho apos wrap de micros
++  if (!temporalEnabled()) return;
++  const uint32_t oldest_us = temporal_scan.oldest(now_us);
++  uint16_t valid = 0;
++  for (uint16_t i=0; i<Config::SCAN_BIN_COUNT; ++i) if (temporal_scan.value(i,now_us)) ++valid;
++  if (valid == 0) return;  // sem captura real, nao inventar timestamp novo
++  uint16_t crc = 0;
++  if (!usbFrameBegin(UsbProtocol::TYPE_SCAN_TIMED, 389U, crc)) return;
++  usbFramePushU16(scan_sequence, crc);
++  usbFramePushU32(millis(), crc);
++  usbFramePushU32(now_us-oldest_us, crc);
++  usbFramePush(lidar_scan_freq_x20, crc);
++  usbFramePushU16(valid, crc);
++  for (uint16_t i=0; i<Config::SCAN_BIN_COUNT; ++i)
++    usbFramePushU16(temporal_scan.value(i,now_us), crc);
++  usbFramePushU32(oldest_us, crc);
++  usbFramePushU32(now_us, crc);
++  usbFramePushU32(micros(), crc);
++  usbFramePushU32(2UL | (static_cast<uint32_t>(temporal_samples_min) << 8) |
++      (static_cast<uint32_t>(temporal_samples_max) << 16) |
++      (static_cast<uint32_t>(temporal_packet_count) << 24), crc);
++  usbFrameEnd(crc);
++}
++
++void resetLidarParser() {
++  lidar_frame_index = 0;
++  lidar_expected_size = 0;
++}
++
++bool validateDeltaChecksum(uint16_t frame_size) {
++  uint16_t sum = 0;
++  for (uint16_t i = 0; i < frame_size - 2U; ++i) {
++    sum = static_cast<uint16_t>(sum + lidar_frame[i]);
++  }
++  return sum == readU16BE(lidar_frame + frame_size - 2U);
++}
++
++bool processDeltaMeasurement(uint16_t frame_size, uint32_t now_us) {
++  const uint16_t packet_length = readU16BE(lidar_frame + 1);
++  const uint16_t data_length = readU16BE(lidar_frame + 6);
++
++  if (packet_length + 2U != frame_size ||
++      packet_length != data_length + 8U ||
++      data_length < 8U ||
++      ((data_length - 5U) % 3U) != 0U) {
++    ++lidar_bad_frames;
++    ++lidar_bad_measurement;
++    return false;
++  }
++
++  const uint16_t sample_count = (data_length - 5U) / 3U;
++
++  if (sample_count == 0U ||
++      sample_count > DeltaProtocol::MAX_SAMPLE_COUNT ||
++      13U + sample_count * 3U + 2U != frame_size) {
++    ++lidar_bad_frames;
++    ++lidar_bad_measurement;
++    return false;
++  }
++
++  lidar_scan_freq_x20 = lidar_frame[8];
++
++  const float start_angle_deg =
++      static_cast<float>(readU16BE(lidar_frame + 11)) * 0.01F;
++
++  const bool completed_rotation =
++      have_previous_packet_angle &&
++      previous_packet_start_deg >= 300.0F &&
++      start_angle_deg < 60.0F;
++
++  if (completed_rotation && scan_active) {
++    queueCompletedScan(now_us - scan_started_us);
++    clearScan();
++    scan_started_us = now_us;
++  }
++
++  if (!scan_active) {
++    scan_active = true;
++    scan_started_us = now_us;
++    clearScan();
++  }
++
++  previous_packet_start_deg = start_angle_deg;
++  have_previous_packet_angle = true;
++
++  if (sample_count < temporal_samples_min) temporal_samples_min = sample_count;
++  if (sample_count > temporal_samples_max) temporal_samples_max = sample_count;
++  if (temporal_packet_count < 255) ++temporal_packet_count;
++  const float angular_step_deg =
++      360.0F /
++      (static_cast<float>(DeltaProtocol::PACKETS_PER_SCAN) *
++       sample_count);
++
++  for (uint16_t i = 0; i < sample_count; ++i) {
++    const uint16_t sample_offset = 13U + i * 3U;
++
++    const uint16_t distance_mm_x4 =
++        readU16BE(lidar_frame + sample_offset + 1U);
++
++    const uint16_t distance_mm =
++        static_cast<uint16_t>(distance_mm_x4 / 4U);
++
++    float sensor_angle_deg =
++        start_angle_deg + static_cast<float>(i) * angular_step_deg;
++
++    while (sensor_angle_deg >= 360.0F) {
++      sensor_angle_deg -= 360.0F;
++    }
++
++    // Delta-2D invertido:
++    // 270 graus do sensor corresponde a frente do robo.
++    const float robot_angle_deg =
++        normalizeAngle180(
++            Config::SENSOR_FRONT_DEG - sensor_angle_deg);
++
++    int16_t bin = static_cast<int16_t>(
++        floorf(
++            (robot_angle_deg + 180.0F) /
++            Config::SCAN_BIN_DEG));
++
++    if (bin < 0) {
++      bin = 0;
++    } else if (
++        bin >= static_cast<int16_t>(Config::SCAN_BIN_COUNT)) {
++      bin = Config::SCAN_BIN_COUNT - 1;
++    }
++
++    const bool valid_distance = distance_mm >= Config::LIDAR_MIN_MM && distance_mm <= Config::LIDAR_MAX_MM;
++    temporal_scan.sample(static_cast<uint16_t>(bin), valid_distance ? distance_mm : 0, now_us);
++    if (!valid_distance) continue;
++
++    uint16_t &stored_mm = scan_ranges_mm[bin];
++
++    if (stored_mm == 0U) {
++      stored_mm = distance_mm;
++      ++scan_valid_bins;
++    } else if (distance_mm < stored_mm) {
++      stored_mm = distance_mm;
++    }
++  }
++
++  return true;
++}
++
++void processCompleteDeltaFrame(uint16_t frame_size, uint32_t now_us) {
++  // Preserva o pacote nativo para investigar resolucao, offset e qualidade.
++  // Somente com host temporal ativo; nao altera o parser nem os bins legados.
++  if (temporalEnabled()) {
++    uint16_t raw_crc = 0;
++    if (usbFrameBegin(UsbProtocol::TYPE_LIDAR_PACKET, frame_size+4U, raw_crc)) {
++      usbFramePushU32(now_us, raw_crc);
++      for (uint16_t i=0; i<frame_size; ++i) usbFramePush(lidar_frame[i], raw_crc);
++      usbFrameEnd(raw_crc);
++    }
++  }
++  if (!validateDeltaChecksum(frame_size)) {
++    ++lidar_bad_checksums;
++    return;
++  }
++
++  if (lidar_frame[3] != DeltaProtocol::VERSION) {
++    ++lidar_bad_frames;
++    ++lidar_bad_version;
++    return;
++  }
++
++  if (lidar_frame[4] != DeltaProtocol::PACKET_TYPE) {
++    ++lidar_bad_frames;
++    ++lidar_bad_packet_type;
++    return;
++  }
++
++  if (lidar_frame[5] == DeltaProtocol::DATA_RPM_AND_MEAS) {
++    if (!processDeltaMeasurement(frame_size, now_us)) {
++      return;
++    }
++  } else if (lidar_frame[5] == DeltaProtocol::DATA_RPM_ONLY) {
++    if (frame_size >= DeltaProtocol::MIN_FRAME_SIZE) {
++      lidar_scan_freq_x20 = lidar_frame[8];
++    }
++  } else {
++    ++lidar_bad_frames;
++    ++lidar_bad_unknown_type;
++    return;
++  }
++
++  // Agora "good" significa realmente aceito pelo parser.
++  ++lidar_good_packets;
++  lidar_last_good_packet_ms = millis();
++}
++
++void processLidarByte(uint8_t value, uint32_t now_ms, uint32_t now_us) {
++  if (lidar_frame_index != 0U &&
++      static_cast<uint32_t>(now_ms - lidar_last_byte_ms) >
++          DeltaProtocol::INTERBYTE_TIMEOUT_MS) {
++    ++lidar_bad_frames;
++    ++lidar_bad_timeout;
++    resetLidarParser();
++  }
++  lidar_last_byte_ms = now_ms;
++
++  if (lidar_frame_index == 0U && value != DeltaProtocol::START_BYTE) {
++    return;
++  }
++
++  if (lidar_frame_index >= DeltaProtocol::MAX_FRAME_SIZE) {
++    ++lidar_bad_frames;
++    ++lidar_bad_overflow;
++    resetLidarParser();
++    return;
++  }
++
++  lidar_frame[lidar_frame_index++] = value;
++
++  if (lidar_frame_index == 3U) {
++    const uint16_t packet_length = readU16BE(lidar_frame + 1);
++    lidar_expected_size = packet_length + 2U;
++    if (lidar_expected_size < DeltaProtocol::MIN_FRAME_SIZE ||
++        lidar_expected_size > DeltaProtocol::MAX_FRAME_SIZE) {
++      ++lidar_bad_frames;
++      ++lidar_bad_size;
++      resetLidarParser();
++      return;
++    }
++  }
++
++  if (lidar_frame_index == 4U && lidar_frame[3] != DeltaProtocol::VERSION) {
++    ++lidar_bad_frames;
++    ++lidar_bad_version;
++    resetLidarParser();
++    return;
++  }
++
++  if (lidar_frame_index == 5U && lidar_frame[4] != DeltaProtocol::PACKET_TYPE) {
++    ++lidar_bad_frames;
++    ++lidar_bad_packet_type;
++    resetLidarParser();
++    return;
++  }
++
++  if (lidar_expected_size != 0U && lidar_frame_index == lidar_expected_size) {
++    processCompleteDeltaFrame(lidar_expected_size, now_us);
++    resetLidarParser();
++  }
++}
++
++void serviceLidarRx() {
++  const int available_now = Serial2.available();
++
++  if (available_now > 0) {
++    lidar_seen_data = true;
++
++    if (static_cast<uint16_t>(available_now) >
++        lidar_max_serial2_available) {
++      lidar_max_serial2_available =
++          static_cast<uint16_t>(available_now);
++    }
++  }
++
++  uint16_t processed = 0;
++
++  // Antes: 96 bytes.
++  // O RX de 256 bytes ja chegou a 255 em testes reais.
++  // 192 reduz fortemente o backlog sem deixar esta rotina monopolizar o loop.
++  while (Serial2.available() > 0 && processed < 192U) {
++    const uint32_t now_ms = millis();
++    const uint32_t now_us = micros();
++
++    const int raw = Serial2.read();
++
++    if (raw < 0) {
++      break;
++    }
++
++    ++lidar_rx_bytes_total;
++    lidar_last_rx_byte_ms = now_ms;
++
++    processLidarByte(
++        static_cast<uint8_t>(raw),
++        now_ms,
++        now_us);
++
++    ++processed;
++  }
++}
++
++
++void resetLidarScanAssembly() {
++  clearScan();
++
++  scan_active = false;
++  scan_started_us = 0;
++
++  previous_packet_start_deg = 0.0F;
++  have_previous_packet_angle = false;
++}
++
++void serviceLidarHealth(uint32_t now_ms) {
++  // Nao fazemos nada antes de o Delta-2D ter enviado pelo menos um byte.
++  if (!lidar_seen_data) {
++    return;
++  }
++
++  const uint32_t byte_age =
++      static_cast<uint32_t>(
++          now_ms - lidar_last_rx_byte_ms);
++
++  const uint32_t packet_age =
++      lidar_last_good_packet_ms == 0U
++          ? 0U
++          : static_cast<uint32_t>(
++                now_ms - lidar_last_good_packet_ms);
++
++  const uint32_t scan_age =
++      lidar_last_completed_scan_ms == 0U
++          ? 0U
++          : static_cast<uint32_t>(
++                now_ms - lidar_last_completed_scan_ms);
++
++  const uint32_t recovery_age =
++      static_cast<uint32_t>(
++          now_ms - lidar_last_recovery_ms);
++
++  // --------------------------------------------------------
++  // CASO A:
++  // Bytes continuam chegando, mas nenhum pacote valido fecha.
++  // Isso indica parser fora de fase / fragmento corrompido.
++  // --------------------------------------------------------
++  if (lidar_last_good_packet_ms != 0U &&
++      byte_age < 150UL &&
++      packet_age > LIDAR_PACKET_STALL_MS &&
++      recovery_age > LIDAR_RECOVERY_COOLDOWN_MS) {
++
++    resetLidarParser();
++    resetLidarScanAssembly();
++
++    ++lidar_parser_recoveries;
++    lidar_last_recovery_ms = now_ms;
++
++    return;
++  }
++
++  // --------------------------------------------------------
++  // CASO B:
++  // Pacotes validos continuam chegando, mas nao conseguimos
++  // concluir uma rotacao / scan.
++  // --------------------------------------------------------
++  if (lidar_last_completed_scan_ms != 0U &&
++      lidar_last_good_packet_ms != 0U &&
++      packet_age < 200UL &&
++      scan_age > LIDAR_SCAN_STALL_MS &&
++      recovery_age > LIDAR_RECOVERY_COOLDOWN_MS) {
++
++    resetLidarScanAssembly();
++
++    ++lidar_scan_recoveries;
++    lidar_last_completed_scan_ms = now_ms;
++    lidar_last_recovery_ms = now_ms;
++
++    return;
++  }
++
++  // --------------------------------------------------------
++  // CASO C:
++  // Nenhum byte na UART por tempo anormal.
++  // Reinicia somente o periferico Serial2, sem reiniciar Mega.
++  // --------------------------------------------------------
++  if (byte_age > LIDAR_UART_SILENCE_MS &&
++      recovery_age > LIDAR_RECOVERY_COOLDOWN_MS) {
++
++    Serial2.end();
++    Serial2.begin(Config::LIDAR_BAUD);
++
++    resetLidarParser();
++    resetLidarScanAssembly();
++
++    ++lidar_uart_recoveries;
++    lidar_last_recovery_ms = now_ms;
++
++    // Impede novo restart a cada iteracao enquanto aguardamos
++    // a retomada do fluxo.
++    lidar_last_rx_byte_ms = now_ms;
++
++    return;
++  }
++}
++
++// ---------- BNO055: somente sensor ----------
++
++Adafruit_BNO055 bno = Adafruit_BNO055(55, Config::BNO055_ADDRESS);
++bool imu_present = false;
++uint16_t imu_sequence = 0;
++uint32_t last_imu_ms = 0;
++uint32_t last_imu_calibration_ms = 0;
++uint8_t imu_cal_system = 0;
++uint8_t imu_cal_gyro = 0;
++uint8_t imu_cal_accel = 0;
++uint8_t imu_cal_mag = 0;
++
++// Robustez BNO055.
++// imu_present passa a significar: sensor disponivel E confiavel para navegacao.
++uint32_t last_imu_health_check_ms = 0;
++uint32_t last_imu_recovery_ms = 0;
++uint32_t last_good_imu_ms = 0;
++uint32_t imu_fault_count = 0;
++
++bool imu_have_heading = false;
++bool imu_rebase_pending = false;
++
++float imu_last_raw_heading_deg = 0.0F;
++float imu_continuous_heading_deg = 0.0F;
++
++constexpr uint32_t IMU_HEALTH_CHECK_MS = 500UL;
++constexpr uint32_t IMU_RECOVERY_PERIOD_MS = 500UL;
++
++// O robo esta limitado a velocidades angulares muito menores que isto.
++// Serve para rejeitar saltos impossiveis sem confundir passagem 359 -> 0.
++constexpr float IMU_MAX_PLAUSIBLE_RATE_DEG_S = 60.0F;
++constexpr float IMU_MIN_ALLOWED_JUMP_DEG = 3.0F;
++
++// Registradores publicos do BNO055.
++constexpr uint8_t BNO055_CHIP_ID_REG = 0x00;
++constexpr uint8_t BNO055_EXPECTED_CHIP_ID = 0xA0;
++constexpr uint8_t BNO055_OPR_MODE_REG = 0x3D;
++constexpr uint8_t BNO055_NDOF_MODE = 0x0C;
++
++int16_t saturateI16(long value) {
++  if (value > 32767L) return 32767;
++  if (value < -32768L) return -32768;
++  return static_cast<int16_t>(value);
++}
++
++float normalizeHeading360(float angle_deg) {
++  while (angle_deg >= 360.0F) {
++    angle_deg -= 360.0F;
++  }
++  while (angle_deg < 0.0F) {
++    angle_deg += 360.0F;
++  }
++  return angle_deg;
++}
++
++float shortestHeadingDelta(float current_deg, float previous_deg) {
++  float delta = current_deg - previous_deg;
++
++  while (delta > 180.0F) {
++    delta -= 360.0F;
++  }
++  while (delta < -180.0F) {
++    delta += 360.0F;
++  }
++
++  return delta;
++}
++
++bool readBnoRegisterSafe(uint8_t reg, uint8_t &value) {
++  Wire.beginTransmission(Config::BNO055_ADDRESS);
++  Wire.write(reg);
++
++  const uint8_t tx_result = Wire.endTransmission(false);
++  if (tx_result != 0U) {
++    return false;
++  }
++
++  const uint8_t received =
++      Wire.requestFrom(Config::BNO055_ADDRESS, static_cast<uint8_t>(1U));
++
++  if (received != 1U || Wire.available() <= 0) {
++    return false;
++  }
++
++  value = static_cast<uint8_t>(Wire.read());
++  return true;
++}
++
++bool bnoRuntimeHealthy() {
++  uint8_t chip_id = 0;
++  uint8_t mode = 0;
++
++  if (!readBnoRegisterSafe(BNO055_CHIP_ID_REG, chip_id) ||
++      chip_id != BNO055_EXPECTED_CHIP_ID) {
++    return false;
++  }
++
++  // Nao deixa a checagem do BNO acumular bytes do Delta-2D.
++  serviceLidarRx();
++  serviceUsbRx(millis());
++  serviceUsbTx();
++
++  if (!readBnoRegisterSafe(BNO055_OPR_MODE_REG, mode)) {
++    return false;
++  }
++
++  serviceLidarRx();
++  serviceUsbRx(millis());
++
++  return mode == BNO055_NDOF_MODE;
++}
++
++void markImuFault() {
++  if (imu_present) {
++    ++imu_fault_count;
++  }
++
++  imu_present = false;
++
++  // Mantemos imu_continuous_heading_deg congelado.
++  // Quando o BNO voltar, a primeira leitura apenas reancora o valor bruto,
++  // sem produzir salto na orientacao entregue ao ROS.
++  imu_rebase_pending = imu_have_heading;
++
++  stopDriveImmediately();
++}
++
++void serviceImuRecovery(uint32_t now_ms) {
++  if (imu_present ||
++      static_cast<uint32_t>(now_ms - last_imu_recovery_ms) <
++          IMU_RECOVERY_PERIOD_MS) {
++    return;
++  }
++
++  last_imu_recovery_ms = now_ms;
++
++  uint8_t chip_id = 0;
++  if (!readBnoRegisterSafe(BNO055_CHIP_ID_REG, chip_id) ||
++      chip_id != BNO055_EXPECTED_CHIP_ID) {
++    return;
++  }
++
++  serviceLidarRx();
++  serviceUsbRx(millis());
++  serviceUsbTx();
++
++  uint8_t mode = 0;
++  if (!readBnoRegisterSafe(BNO055_OPR_MODE_REG, mode)) {
++    return;
++  }
++
++  if (mode != BNO055_NDOF_MODE) {
++    // Recuperacao leve. Evitamos bno.begin() em runtime porque a rotina da
++    // biblioteca pode bloquear por bastante tempo durante uma reinicializacao.
++    serviceLidarRx();
++    serviceUsbTx();
++
++    bno.setMode(OPERATION_MODE_NDOF);
++
++    // setMode() possui um pequeno delay. Descartamos qualquer fragmento de
++    // pacote acumulado nesse intervalo para o Delta-2D resincronizar limpo.
++    while (Serial2.available() > 0) {
++      Serial2.read();
++    }
++    resetLidarParser();
++
++    if (!readBnoRegisterSafe(BNO055_OPR_MODE_REG, mode) ||
++        mode != BNO055_NDOF_MODE) {
++      return;
++    }
++  }
++
++  imu_present = true;
++  imu_rebase_pending = imu_have_heading;
++  last_imu_ms = now_ms;
++  last_imu_health_check_ms = now_ms;
++}
++
++void serviceImu(uint32_t now_ms) {
++  if (!imu_present) {
++    serviceImuRecovery(now_ms);
++    return;
++  }
++
++  if (static_cast<uint32_t>(now_ms - last_imu_ms) <
++      Config::IMU_PERIOD_MS) {
++    return;
++  }
++
++  last_imu_ms = now_ms;
++
++  // Checagem direta e barata do CHIP_ID + modo NDOF.
++  // Nao usamos getSystemStatus() aqui porque a biblioteca introduz delay
++  // significativo nessa chamada.
++  if (static_cast<uint32_t>(now_ms - last_imu_health_check_ms) >=
++      IMU_HEALTH_CHECK_MS) {
++    last_imu_health_check_ms = now_ms;
++
++    if (!bnoRuntimeHealthy()) {
++      markImuFault();
++      return;
++    }
++  }
++
++  const uint32_t imu_capture_begin_us = micros();
++  sensors_event_t orientation_event;
++  sensors_event_t gyro_event;
++
++  bno.getEvent(&orientation_event, Adafruit_BNO055::VECTOR_EULER);
++
++  serviceLidarRx();
++  serviceUsbRx(millis());
++  serviceUsbTx();
++
++  bno.getEvent(&gyro_event, Adafruit_BNO055::VECTOR_GYROSCOPE);
++
++  serviceLidarRx();
++  serviceUsbRx(millis());
++  serviceUsbTx();
++
++  if (static_cast<uint32_t>(now_ms - last_imu_calibration_ms) >=
++      Config::IMU_CALIBRATION_PERIOD_MS) {
++    last_imu_calibration_ms = now_ms;
++
++    bno.getCalibration(&imu_cal_system, &imu_cal_gyro, &imu_cal_accel,
++                       &imu_cal_mag);
++
++    serviceLidarRx();
++    serviceUsbRx(millis());
++  }
++
++  const float raw_heading_deg = orientation_event.orientation.x;
++
++  if (!imu_have_heading) {
++    imu_last_raw_heading_deg = raw_heading_deg;
++    imu_continuous_heading_deg = normalizeHeading360(raw_heading_deg);
++    imu_have_heading = true;
++    imu_rebase_pending = false;
++  } else if (imu_rebase_pending) {
++    // Sensor voltou depois de uma falha.
++    // A nova referencia bruta e aceita, mas a orientacao entregue ao ROS
++    // permanece exatamente onde estava antes da falha.
++    imu_last_raw_heading_deg = raw_heading_deg;
++    imu_rebase_pending = false;
++  } else {
++    const float delta_deg =
++        shortestHeadingDelta(raw_heading_deg, imu_last_raw_heading_deg);
++
++    uint32_t dt_ms =
++        static_cast<uint32_t>(now_ms - last_good_imu_ms);
++
++    if (last_good_imu_ms == 0U || dt_ms == 0U) {
++      dt_ms = Config::IMU_PERIOD_MS;
++    }
++
++    float allowed_jump_deg =
++        IMU_MAX_PLAUSIBLE_RATE_DEG_S *
++        (static_cast<float>(dt_ms) / 1000.0F);
++
++    if (allowed_jump_deg < IMU_MIN_ALLOWED_JUMP_DEG) {
++      allowed_jump_deg = IMU_MIN_ALLOWED_JUMP_DEG;
++    }
++
++    if (fabsf(delta_deg) > allowed_jump_deg) {
++      // Exemplo do erro observado:
++      // heading real ~ -9.7 graus -> leitura 0 instantaneamente.
++      // Esse valor nao chega ao ROS.
++      markImuFault();
++      return;
++    }
++
++    imu_continuous_heading_deg =
++        normalizeHeading360(imu_continuous_heading_deg + delta_deg);
++
++    imu_last_raw_heading_deg = raw_heading_deg;
++  }
++
++  last_good_imu_ms = now_ms;
++
++  const int32_t heading_mdeg = static_cast<int32_t>(
++      lroundf(imu_continuous_heading_deg * 1000.0F));
++
++  const int16_t gyro_z_mrad_s = saturateI16(
++      lroundf(gyro_event.gyro.z * 1000.0F));
++
++  const bool timed_imu = temporalEnabled();
++  const uint16_t payload_size = timed_imu ? 28U : 16U;
++  uint16_t crc = 0;
++
++  if (!usbFrameBegin(timed_imu ? UsbProtocol::TYPE_IMU_TIMED : UsbProtocol::TYPE_IMU, payload_size, crc)) {
++    return;
++  }
++
++  usbFramePushU16(imu_sequence++, crc);
++  usbFramePushU32(now_ms, crc);
++  usbFramePushI32(heading_mdeg, crc);
++  usbFramePushI16(gyro_z_mrad_s, crc);
++  usbFramePush(imu_cal_system, crc);
++  usbFramePush(imu_cal_gyro, crc);
++  usbFramePush(imu_cal_accel, crc);
++  usbFramePush(imu_cal_mag, crc);
++  // Begin antecede leituras I2C; fim inclui EULER, gyro e calibracao.
++  if (timed_imu) {
++    usbFramePushU32(imu_capture_begin_us, crc);
++    usbFramePushU32(micros(), crc);
++    usbFramePushU32(micros(), crc);
++  }
++  usbFrameEnd(crc);
++}
++
++// ---------- Motor do LiDAR e telemetria ----------
++
++uint32_t lidar_motor_started_ms = 0;
++bool lidar_motor_in_startup = true;
++
++void serviceLidarMotor(uint32_t now_ms) {
++  if (lidar_motor_in_startup &&
++      static_cast<uint32_t>(now_ms - lidar_motor_started_ms) >=
++          Config::LIDAR_START_TIME_MS) {
++    analogWrite(Config::LIDAR_MOTOR_PWM_PIN, Config::LIDAR_WORK_PWM);
++    lidar_motor_in_startup = false;
++  }
++}
++
++uint16_t saturateU16(uint32_t value) {
++  return value > 65535UL ? 65535U : static_cast<uint16_t>(value);
++}
++
++void queueStatus(uint32_t now_ms) {
++  constexpr uint16_t payload_size = 88U;
++  uint16_t crc = 0;
++  if (!usbFrameBegin(UsbProtocol::TYPE_STATUS, payload_size, crc)) {
++    return;
++  }
++
++  usbFramePushU16(last_command_sequence, crc);
++  usbFramePushU32(now_ms, crc);
++  const uint16_t command_age = command_received
++                                   ? saturateU16(now_ms - last_valid_command_ms)
++                                   : 65535U;
++  usbFramePushU16(command_age, crc);
++  for (uint8_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
++    usbFramePushI16(target_wheel_pwm[wheel], crc);
++  }
++  for (uint8_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
++    usbFramePushI16(static_cast<int16_t>(lroundf(current_wheel_pwm[wheel])), crc);
++  }
++  usbFramePush(lidar_scan_freq_x20, crc);
++  usbFramePushU16(last_scan_valid_bins, crc);
++  usbFramePushU32(lidar_good_packets, crc);
++  usbFramePushU32(lidar_bad_checksums, crc);
++  usbFramePushU32(lidar_bad_frames, crc);
++  usbFramePushU32(usb_rx_bad_frames, crc);
++  usbFramePushU32(usb_tx_dropped_frames, crc);
++  usbFramePush(watchdog_active ? 1U : 0U, crc);
++  usbFramePush(lidar_motor_in_startup ? Config::LIDAR_START_PWM
++                                     : Config::LIDAR_WORK_PWM,
++               crc);
++  usbFramePush(imu_present ? 1U : 0U, crc);
++  usbFramePush(imu_cal_system, crc);
++  usbFramePush(imu_cal_gyro, crc);
++  usbFramePush(imu_cal_accel, crc);
++  usbFramePush(imu_cal_mag, crc);
++
++  usbFramePushU32(lidar_bad_timeout, crc);
++  usbFramePushU32(lidar_bad_size, crc);
++  usbFramePushU32(lidar_bad_version, crc);
++  usbFramePushU32(lidar_bad_packet_type, crc);
++  usbFramePushU32(lidar_bad_measurement, crc);
++  usbFramePushU32(lidar_bad_unknown_type, crc);
++  usbFramePushU32(lidar_bad_overflow, crc);
++  usbFramePushU16(lidar_max_serial2_available, crc);
++  usbFramePushU32(max_loop_gap_us, crc);
++
++  usbFrameEnd(crc);
++}
++
++void setupMotorPin(const MotorPins &pins) {
++  pinMode(pins.forward_pwm, OUTPUT);
++  pinMode(pins.reverse_pwm, OUTPUT);
++  analogWrite(pins.forward_pwm, 0);
++  analogWrite(pins.reverse_pwm, 0);
++}
++
++void setup() {
++  setupMotorPin(M1);
++  setupMotorPin(M2);
++  setupMotorPin(M3);
++  setupMotorPin(M4);
++  stopDriveImmediately();
++
++  pinMode(Config::LIDAR_MOTOR_PWM_PIN, OUTPUT);
++  analogWrite(Config::LIDAR_MOTOR_PWM_PIN, Config::LIDAR_START_PWM);
++  lidar_motor_started_ms = millis();
++
++  clearScan();
++  Serial2.begin(Config::LIDAR_BAUD);
++  Serial.begin(Config::USB_BAUD);
++
++  Wire.begin();
++  Wire.setWireTimeout(5000, true);
++  
++  imu_present = bno.begin();
++  if (imu_present) {
++    bno.setExtCrystalUse(true);
++  }
++
++  const uint32_t now_ms = millis();
++  last_motor_update_ms = now_ms;
++  last_imu_ms = now_ms;
++  last_imu_calibration_ms = now_ms;
++}
++
++void loop() {
++  const uint32_t loop_entry_us = micros();
++
++  if (last_loop_entry_us != 0U) {
++    const uint32_t loop_gap_us =
++        static_cast<uint32_t>(loop_entry_us - last_loop_entry_us);
++
++    if (loop_gap_us > max_loop_gap_us) {
++      max_loop_gap_us = loop_gap_us;
++    }
++  }
++
++  last_loop_entry_us = loop_entry_us;
++
++  const uint32_t now_ms = millis();
++
++  serviceLidarRx();
++  serviceUsbRx(now_ms);
++
++  // Sem referencia angular confiavel, o robo nao deve continuar navegando.
++  if (imu_present) {
++    serviceMotors(now_ms);
++  } else {
++    stopDriveImmediately();
++  }
++
++  serviceLidarMotor(now_ms);
++
++  // Libera a fila USB antes das leituras I2C do BNO055.
++  serviceUsbTx();
++  serviceImu(now_ms);
++  queueTemporalSnapshot();
++
++  // Segunda drenagem imediatamente apos a IMU: impede que bytes recebidos
++  // durante as transacoes I2C permaneçam acumulados ate a proxima volta.
++  serviceLidarRx();
++  serviceUsbRx(millis());
++
++  // Detecta e recupera perda de sincronismo, scan travado
++  // ou UART silenciosa antes do source_timeout do Nav2.
++  serviceLidarHealth(millis());
++
++  static uint32_t last_status_ms = 0;
++  if (static_cast<uint32_t>(now_ms - last_status_ms) >= Config::STATUS_PERIOD_MS) {
++    last_status_ms = now_ms;
++    queueStatus(now_ms);
++  }
++
++  serviceUsbTx();
++}
+\ No newline at end of file
+diff --git a/firmware/mega_mecanum_temporal/sliding_scan.h b/firmware/mega_mecanum_temporal/sliding_scan.h
+new file mode 100644
+index 0000000..ed3ca23
+--- /dev/null
++++ b/firmware/mega_mecanum_temporal/sliding_scan.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <stdint.h>
++// Janela deslizante de RECEPCAO no MCU. Nao cria timestamp optico.
++struct SlidingScan180 {
++  uint16_t ranges[180] = {};
++  uint32_t stamps[180] = {};
++  void sample(uint16_t bin, uint16_t mm, uint32_t packet_us) {
++    if (bin >= 180) return;
++    if (stamps[bin] != packet_us) { ranges[bin] = 0; stamps[bin] = packet_us; }
++    // Invalido nao transforma falta de eco em livre e substitui leitura antiga.
++    if (mm && (!ranges[bin] || mm < ranges[bin])) ranges[bin] = mm;
++  }
++  void expire(uint32_t now_us) {
++    for (uint16_t i=0; i<180; ++i) {
++      if (stamps[i] && uint32_t(now_us-stamps[i]) > 250000UL) {
++        stamps[i]=0; ranges[i]=0;
++      }
++    }
++  }
++  uint16_t value(uint16_t bin, uint32_t now_us) const {
++    return stamps[bin] && uint32_t(now_us-stamps[bin]) <= 250000UL ? ranges[bin] : 0;
++  }
++  uint32_t oldest(uint32_t now_us) const {
++    uint32_t oldest_age = 0;
++    for (uint16_t i=0; i<180; ++i) {
++      if (value(i,now_us) && uint32_t(now_us-stamps[i]) > oldest_age) oldest_age=now_us-stamps[i];
++    }
++    return now_us-oldest_age;
++  }
++};
+--- a/src/robo_hardware/CMakeLists.txt
++++ b/src/robo_hardware/CMakeLists.txt
+@@ -15,6 +15,7 @@
+ 
+ add_executable(hardware_bridge_node src/hardware_bridge_node.cpp)
+ target_compile_features(hardware_bridge_node PUBLIC cxx_std_17)
++target_include_directories(hardware_bridge_node PRIVATE include)
+ ament_target_dependencies(hardware_bridge_node
+   diagnostic_msgs
+   geometry_msgs
+@@ -32,4 +33,12 @@
+   DESTINATION share/${PROJECT_NAME}
+ )
+ 
++if(BUILD_TESTING)
++  enable_testing()
++  add_executable(test_sensor_clock test/test_sensor_clock.cpp)
++  target_include_directories(test_sensor_clock PRIVATE include)
++  target_compile_features(test_sensor_clock PRIVATE cxx_std_17)
++  add_test(NAME sensor_clock COMMAND test_sensor_clock)
++endif()
++
+ ament_package()
+--- a/src/robo_hardware/launch/hardware.launch.py
++++ b/src/robo_hardware/launch/hardware.launch.py
+@@ -2,6 +2,9 @@
+ 
+ from ament_index_python.packages import get_package_share_directory
+ from launch import LaunchDescription
++from launch.actions import DeclareLaunchArgument
++from launch.substitutions import LaunchConfiguration
++from launch_ros.parameter_descriptions import ParameterValue
+ from launch_ros.actions import Node
+ 
+ 
+@@ -11,12 +14,24 @@
+ 
+     return LaunchDescription(
+         [
++            DeclareLaunchArgument('temporal_enabled', default_value='false'),
++            DeclareLaunchArgument('command_authority', default_value=''),
++            DeclareLaunchArgument('heading_hold_enabled', default_value='true'),
++            DeclareLaunchArgument('device_clock_drift_bound_ppm', default_value='-1.0'),
++            DeclareLaunchArgument('lidar_capture_lag_bound_s', default_value='-1.0'),
++            DeclareLaunchArgument('imu_capture_lag_bound_s', default_value='-1.0'),
+             Node(
+                 package="robo_hardware",
+                 executable="hardware_bridge_node",
+                 name="robo_hardware",
+                 output="screen",
+-                parameters=[str(parameters)],
++                parameters=[str(parameters), {
++                    'temporal_enabled': ParameterValue(LaunchConfiguration('temporal_enabled'), value_type=bool),
++                    'command_authority': ParameterValue(LaunchConfiguration('command_authority'), value_type=str),
++                    'heading_hold_enabled': ParameterValue(LaunchConfiguration('heading_hold_enabled'), value_type=bool),
++                    **{k: ParameterValue(LaunchConfiguration(k), value_type=float) for k in
++                       ('device_clock_drift_bound_ppm', 'lidar_capture_lag_bound_s', 'imu_capture_lag_bound_s')}
++                }],
+             )
+         ]
+     )
+--- a/src/robo_hardware/src/hardware_bridge_node.cpp
++++ b/src/robo_hardware/src/hardware_bridge_node.cpp
+@@ -7,6 +7,8 @@
+ #include <cstring>
+ #include <fcntl.h>
+ #include <limits>
++#include <sstream>
++#include "robo_hardware/sensor_clock.hpp"
+ #include <poll.h>
+ #include <stdexcept>
+ #include <string>
+@@ -25,6 +27,8 @@
+ #include "sensor_msgs/msg/laser_scan.hpp"
+ #include "std_msgs/msg/bool.hpp"
+ #include "std_msgs/msg/float64.hpp"
++#include "std_msgs/msg/string.hpp"
++#include "std_msgs/msg/u_int8_multi_array.hpp"
+ 
+ namespace
+ {
+@@ -184,6 +188,24 @@
+     heading_hold_imu_timeout_s_ = declare_parameter<double>(
+       "heading_hold_imu_timeout_s", 0.20);
+ 
++    command_authority_ = declare_parameter<std::string>("command_authority", "");
++    temporal_enabled_ = declare_parameter<bool>("temporal_enabled", false);
++    clock_drift_ppm_ = declare_parameter<double>("device_clock_drift_bound_ppm", -1.0);
++    lidar_capture_lag_ = declare_parameter<double>("lidar_capture_lag_bound_s", -1.0);
++    imu_capture_lag_ = declare_parameter<double>("imu_capture_lag_bound_s", -1.0);
++    if (!std::isfinite(clock_drift_ppm_) || !std::isfinite(lidar_capture_lag_) || !std::isfinite(imu_capture_lag_)) {
++      throw std::invalid_argument("temporal bounds must be finite; -1 means unknown");
++    }
++    scan_temporal_publisher_ = create_publisher<sensor_msgs::msg::LaserScan>(
++      "scan_raw_temporal", rclcpp::SensorDataQoS());
++    imu_temporal_publisher_ = create_publisher<sensor_msgs::msg::Imu>(
++      "imu/data_temporal", rclcpp::SensorDataQoS());
++    timing_publisher_ = create_publisher<std_msgs::msg::String>("hardware/sensor_timing", 20);
++    tx_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/tx_frames", 20);
++    rx_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/serial_rx", 20);
++    lidar_packet_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/lidar_packets", 100);
++    effective_publisher_ = create_publisher<geometry_msgs::msg::TwistStamped>("cmd_vel_hardware", 20);
++    probe_timer_ = create_wall_timer(200ms, [this]() { send_clock_probe(); });
+     validate_parameters();
+ 
+     parameter_callback_handle_ = add_on_set_parameters_callback(
+@@ -202,7 +224,18 @@
+ 
+     command_subscription_ = create_subscription<geometry_msgs::msg::TwistStamped>(
+       "cmd_vel", rclcpp::QoS(10).reliable(),
+-      [this](const geometry_msgs::msg::TwistStamped::SharedPtr message) {
++      [this](const geometry_msgs::msg::TwistStamped::SharedPtr message, const rclcpp::MessageInfo &info) {
++        if (!command_authority_.empty()) {
++          const auto publishers = get_publishers_info_by_topic("/cmd_vel");
++          const auto &gid = info.get_rmw_message_info().publisher_gid;
++          if (publishers.size() != 1 || publishers[0].node_name() != command_authority_ ||
++              !std::equal(publishers[0].endpoint_gid().begin(), publishers[0].endpoint_gid().end(), gid.data)) {
++            have_velocity_command_ = false;
++            reset_heading_hold();
++            queue_motor_command({0, 0, 0, 0}, 0);
++            return;
++          }
++        }
+         receive_command(*message);
+       });
+ 
+@@ -350,6 +383,11 @@
+     try {
+       for (const auto & parameter : parameters) {
+         const std::string & name = parameter.get_name();
++        if (name == "command_authority" || name == "temporal_enabled" || name == "device_clock_drift_bound_ppm" ||
++          name == "lidar_capture_lag_bound_s" || name == "imu_capture_lag_bound_s") {
++          result.reason = "temporal protocol settings require process restart";
++          return result;
++        }
+         if (name == "heading_hold_enabled") {
+           enabled = parameter.as_bool();
+         } else if (name == "heading_hold_kp") {
+@@ -420,10 +458,22 @@
+     if (!std::isfinite(linear_x) || !std::isfinite(linear_y) ||
+       !std::isfinite(angular_z))
+     {
+-      RCLCPP_WARN(get_logger(), "Ignoring non-finite velocity command");
+-      return;
+-    }
+-
++      have_velocity_command_ = false;
++      reset_heading_hold();
++      queue_motor_command({0, 0, 0, 0}, 0);
++      RCLCPP_WARN(get_logger(), "Stopping on non-finite velocity command");
++      return;
++    }
++
++    const int64_t source_ns = (message.header.stamp.sec >= 0 && message.header.stamp.nanosec < 1000000000U)
++      ? rclcpp::Time(message.header.stamp).nanoseconds() : 0;
++    if (!robo_hardware::valid_command_stamp(source_ns, now().nanoseconds(), command_timeout_s_)) {
++      have_velocity_command_ = false;
++      reset_heading_hold();
++      queue_motor_command({0, 0, 0, 0}, 0);
++      RCLCPP_WARN(get_logger(), "Velocity command source timestamp invalid/stale");
++      return;
++    }
+     commanded_vx_mps_ = linear_x;
+     commanded_vy_mps_ = linear_y;
+     commanded_wz_rps_ = angular_z;
+@@ -483,6 +533,8 @@
+     serial_command_ready_time_ = steady_clock_.now() +
+       rclcpp::Duration::from_seconds(serial_startup_delay_s_);
+     reset_rx_parser();
++    sensor_clock_.reset();
++    probe_pending_ = false;
+     pending_tx_frame_.clear();
+     pending_tx_offset_ = 0;
+     RCLCPP_INFO(
+@@ -498,6 +550,8 @@
+       serial_fd_ = -1;
+     }
+     reset_rx_parser();
++    sensor_clock_.reset();
++    probe_pending_ = false;
+     pending_tx_frame_.clear();
+     pending_tx_offset_ = 0;
+     have_latest_imu_ = false;
+@@ -567,6 +621,9 @@
+             get_logger(), "First serial RX after %.3f s (%zd bytes)",
+             (steady_clock_.now() - serial_open_time_).seconds(), count);
+         }
++        std_msgs::msg::UInt8MultiArray raw;
++        raw.data.assign(read_buffer.begin(), read_buffer.begin()+count);
++        rx_publisher_->publish(raw);
+         host_rx_bytes_ += static_cast<uint64_t>(count);
+         ++host_rx_reads_;
+         for (ssize_t i = 0; i < count; ++i) {
+@@ -648,7 +705,20 @@
+ 
+     const uint8_t type = rx_frame_[1];
+     const uint8_t * payload = rx_frame_.data() + 4;
+-    if (type == kTypeScan && payload_size == kScanPayloadSize) {
++    if (type == 0x16 && payload_size >= 15U && payload_size <= 164U) {
++      std_msgs::msg::UInt8MultiArray packet;
++      packet.data.assign(payload, payload+payload_size);
++      lidar_packet_publisher_->publish(packet);
++    } else if (type == 0x14 && payload_size == 8U && probe_pending_) {
++      if (read_u32_le(payload) == probe_token_) {
++        sensor_clock_.anchor(probe_sent_, steady_clock_.now().seconds(), read_u32_le(payload+4));
++        probe_pending_ = false;
++      }
++    } else if (type == 0x13 && payload_size == kScanPayloadSize+16U) {
++      publish_scan(payload, true);
++    } else if (type == 0x15 && payload_size == kImuPayloadSize+12U) {
++      publish_imu(payload, true);
++    } else if (type == kTypeScan && payload_size == kScanPayloadSize) {
+       publish_scan(payload);
+     } else if (type == kTypeStatus && payload_size == kStatusPayloadSize) {
+       publish_status(payload);
+@@ -659,7 +729,72 @@
+     }
+   }
+ 
+-  void publish_scan(const uint8_t * payload)
++  void send_clock_probe()
++  {
++    if (!temporal_enabled_ || serial_fd_ < 0 || !pending_tx_frame_.empty() ||
++      steady_clock_.now() < serial_command_ready_time_) return;
++    if (probe_pending_ && steady_clock_.now().seconds()-probe_sent_ < 0.5) return;
++    // Probe nunca interrompe quadro de motor. Espera de fila entra no RTT medido.
++    probe_pending_ = true;
++    probe_sent_ = steady_clock_.now().seconds();
++    ++probe_token_;
++    std::vector<uint8_t> frame{kSof1, kSof2, kProtocolVersion, 0x02};
++    append_u16_le(frame, 4U);
++    frame.push_back(probe_token_ & 0xff);
++    frame.push_back((probe_token_ >> 8) & 0xff);
++    frame.push_back((probe_token_ >> 16) & 0xff);
++    frame.push_back((probe_token_ >> 24) & 0xff);
++    append_u16_le(frame, crc16_ccitt(frame.data()+2, frame.size()-2));
++    pending_tx_frame_ = std::move(frame);
++    pending_tx_offset_ = 0;
++    flush_serial_tx();
++  }
++
++  int64_t temporal_stamp(const char * sensor, const uint8_t * payload,
++    std::size_t offset, double lag, const builtin_interfaces::msg::Time &publication)
++  {
++    double age = 0, uncertainty = 0;
++    uint32_t begin = 0, end = 0, queued = 0;
++    if (offset) {
++      begin = read_u32_le(payload+offset);
++      end = read_u32_le(payload+offset+4);
++      queued = read_u32_le(payload+offset+8);
++    }
++    bool valid = temporal_enabled_ && offset && sensor_clock_.oldest(
++      steady_clock_.now().seconds(), begin, end, queued, clock_drift_ppm_, lag, age, uncertainty);
++    int64_t stamp_ns = 0;
++    if (valid) stamp_ns = rclcpp::Time(publication).nanoseconds()-static_cast<int64_t>(age*1e9);
++    if (stamp_ns <= 0) valid = false;
++    const uint32_t geometry = offset == kScanPayloadSize ? read_u32_le(payload+offset+12) : 0;
++    if (offset == kScanPayloadSize && (geometry & 0xffU) != 2U) valid = false;
++    const char * reason = valid ? "ok" : (!temporal_enabled_ ? "disabled" :
++      (!offset ? "legacy_frame" : (clock_drift_ppm_ < 0 || lag < 0 ? "unknown_capture_or_clock_bound" :
++        (!sensor_clock_.anchored ? "clock_unsynchronized" : "stale_or_inconsistent_window"))));
++    std::ostringstream json;
++    json.precision(17);
++    json << "{\"schema\":1,\"sensor\":\"" << sensor << "\",\"valid\":"
++      << (valid ? "true" : "false") << ",\"reason\":\"" << reason << "\",\"timed_frame\":" << (offset ? "true" : "false")
++      << ",\"capture_begin_us\":" << begin << ",\"capture_end_us\":" << end
++      << ",\"queued_us\":" << queued << ",\"age_upper_s\":" << age
++      << ",\"uncertainty_s\":" << uncertainty << ",\"stamp_ns\":" << stamp_ns
++      << ",\"publication_stamp_ns\":" << rclcpp::Time(publication).nanoseconds()
++      << ",\"probe_host_sent_s\":" << sensor_clock_.sent
++      << ",\"probe_host_received_s\":" << sensor_clock_.received
++      << ",\"probe_device_us\":" << sensor_clock_.device
++      << ",\"drift_bound_ppm\":" << clock_drift_ppm_
++      << ",\"capture_lag_bound_s\":" << lag
++      << ",\"scan_capture_schema\":" << (geometry & 0xffU)
++      << ",\"samples_per_packet_min\":" << ((geometry >> 8) & 0xffU)
++      << ",\"samples_per_packet_max\":" << ((geometry >> 16) & 0xffU)
++      << ",\"packets_in_scan\":" << ((geometry >> 24) & 0xffU)
++      << ",\"capture_kind\":\"mcu_receive_or_i2c_window\"}";
++    std_msgs::msg::String msg;
++    msg.data = json.str();
++    timing_publisher_->publish(msg);
++    return valid ? stamp_ns : 0;
++  }
++
++  void publish_scan(const uint8_t * payload, bool timed = false)
+   {
+     const uint32_t scan_time_us = read_u32_le(payload + 6);
+     const uint8_t frequency_x20 = payload[10];
+@@ -694,7 +829,15 @@
+       }
+     }
+ 
+-    scan_publisher_->publish(message);
++    if (!timed) scan_publisher_->publish(message);
++    auto stamp = temporal_stamp("lidar", payload, timed ? kScanPayloadSize : 0U,
++      lidar_capture_lag_, message.header.stamp);
++    if (stamp > 0) {
++      message.header.stamp = rclcpp::Time(stamp);
++      // Bins agregados/invertidos nao possuem ordem temporal conhecida por raio.
++      message.time_increment = 0.0F;
++      scan_temporal_publisher_->publish(message);
++    }
+     ++published_scans_;
+   }
+ 
+@@ -738,7 +881,7 @@
+     publish_diagnostics(status);
+   }
+ 
+-  void publish_imu(const uint8_t * payload)
++  void publish_imu(const uint8_t * payload, bool timed = false)
+   {
+     const int32_t heading_mdeg = read_i32_le(payload + 6);
+     const int16_t gyro_z_mrad_s = read_i16_le(payload + 10);
+@@ -779,6 +922,12 @@
+     message.angular_velocity_covariance[8] = 0.02;
+     message.linear_acceleration_covariance[0] = -1.0;
+     imu_publisher_->publish(message);
++    auto stamp = temporal_stamp("imu", payload, timed ? kImuPayloadSize : 0U,
++      imu_capture_lag_, message.header.stamp);
++    if (stamp > 0) {
++      message.header.stamp = rclcpp::Time(stamp);
++      imu_temporal_publisher_->publish(message);
++    }
+ 
+     std_msgs::msg::Float64 yaw_message;
+     yaw_message.data = yaw_rad * 180.0 / kPi;
+@@ -1070,6 +1219,12 @@
+ 
+   void queue_motor_command(const std::array<int16_t, 4> & pwm, uint8_t flags)
+   {
++    if ((flags & kFlagEnable) == 0 || std::all_of(pwm.begin(), pwm.end(), [](int16_t v) {return v == 0;})) {
++      geometry_msgs::msg::TwistStamped zero;
++      zero.header.stamp = now();
++      zero.header.frame_id = "base_link";
++      effective_publisher_->publish(zero);
++    }
+     if (serial_fd_ < 0 || steady_clock_.now() < serial_command_ready_time_) {
+       return;
+     }
+@@ -1094,6 +1249,9 @@
+       host_tx_bytes_ += static_cast<uint64_t>(written);
+       pending_tx_offset_ += static_cast<std::size_t>(written);
+       if (pending_tx_offset_ == pending_tx_frame_.size()) {
++        std_msgs::msg::UInt8MultiArray bytes;
++        bytes.data = pending_tx_frame_;
++        tx_publisher_->publish(bytes);
+         pending_tx_frame_.clear();
+         pending_tx_offset_ = 0;
+       }
+@@ -1123,7 +1281,15 @@
+       return;
+     }
+ 
+-    queue_motor_command(calculate_motor_pwm(controlled_angular_velocity()), kFlagEnable);
++    const double effective_wz = controlled_angular_velocity();
++    geometry_msgs::msg::TwistStamped effective;
++    effective.header.stamp = now();
++    effective.header.frame_id = "base_link";
++    effective.twist.linear.x = commanded_vx_mps_;
++    effective.twist.linear.y = commanded_vy_mps_;
++    effective.twist.angular.z = effective_wz;
++    effective_publisher_->publish(effective);
++    queue_motor_command(calculate_motor_pwm(effective_wz), kFlagEnable);
+   }
+ 
+   void send_emergency_stop_best_effort()
+@@ -1208,6 +1374,19 @@
+     }
+   }
+ 
++  std::string command_authority_;
++  bool temporal_enabled_{false}, probe_pending_{false};
++  uint32_t probe_token_{0};
++  double probe_sent_{0}, clock_drift_ppm_{-1}, lidar_capture_lag_{-1}, imu_capture_lag_{-1};
++  robo_hardware::SensorClock sensor_clock_;
++  rclcpp::TimerBase::SharedPtr probe_timer_;
++  rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_temporal_publisher_;
++  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_temporal_publisher_;
++  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr timing_publisher_;
++  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr tx_publisher_;
++  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr rx_publisher_;
++  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr lidar_packet_publisher_;
++  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr effective_publisher_;
+   std::string serial_port_;
+   int serial_baud_{500000};
+   double serial_startup_delay_s_{5.0};
+diff --git a/src/robo_hardware/include/robo_hardware/sensor_clock.hpp b/src/robo_hardware/include/robo_hardware/sensor_clock.hpp
+new file mode 100644
+index 0000000..6fe1f11
+--- /dev/null
++++ b/src/robo_hardware/include/robo_hardware/sensor_clock.hpp
+@@ -0,0 +1,48 @@
++#pragma once
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <limits>
++
++namespace robo_hardware {
++inline bool valid_command_stamp(int64_t source_ns, int64_t now_ns, double limit_s) {
++  return source_ns > 0 && now_ns >= source_ns && std::isfinite(limit_s) &&
++    limit_s > 0 && (now_ns-source_ns)*1e-9 <= limit_s;
++}
++// Intervalo causal: host_send <= instante da leitura do micros no probe <= host_recv.
++// Sem simetria presumida da serial. ppm e lag precisam de limites comprovados.
++struct SensorClock {
++  double sent = 0, received = 0;
++  uint32_t device = 0;
++  bool anchored = false;
++  void reset() { anchored = false; }
++  bool anchor(double tx, double rx, uint32_t us) {
++    anchored = std::isfinite(tx) && std::isfinite(rx) && rx >= tx && rx-tx <= 0.3;
++    sent = tx; received = rx; device = us;
++    return anchored;
++  }
++  bool oldest(double host_now, uint32_t begin, uint32_t end, uint32_t queued,
++    double drift_ppm, double sensor_lag, double &age_upper, double &uncertainty) const
++  {
++    if (!anchored || drift_ppm < 0 || drift_ppm > 100000 || sensor_lag < 0 ||
++      !std::isfinite(drift_ppm) || !std::isfinite(sensor_lag) ||
++      host_now < received || host_now-received > 1.0) return false;
++    const int32_t span = static_cast<int32_t>(end-begin);
++    const int32_t queue = static_cast<int32_t>(queued-end);
++    const double delta = static_cast<int32_t>(begin-device)*1e-6;
++    if (span < 0 || span > 1000000 || queue < 0 || queue > 1000000 ||
++      std::abs(delta) > 2.0) return false;
++    // Para duracao d do dispositivo, duracao host esta em [d/(1+p),d/(1-p)].
++    const double p = drift_ppm*1e-6;
++    const double d1 = delta/(1+p), d2 = delta/(1-p);
++    const double lower = sent+std::min(d1,d2)-sensor_lag;
++    const double upper = received+std::max(d1,d2);
++    const double queued_delta = static_cast<int32_t>(queued-device)*1e-6;
++    const double earliest_queue = sent+std::min(queued_delta/(1+p),queued_delta/(1-p));
++    if (earliest_queue > host_now || lower > host_now || upper < lower) return false;
++    age_upper = host_now-lower;
++    uncertainty = upper-lower;
++    return std::isfinite(age_upper) && age_upper >= 0 && age_upper <= 0.3;
++  }
++};
++}
+diff --git a/src/robo_hardware/test/test_sensor_clock.cpp b/src/robo_hardware/test/test_sensor_clock.cpp
+new file mode 100644
+index 0000000..7e7ac1e
+--- /dev/null
++++ b/src/robo_hardware/test/test_sensor_clock.cpp
+@@ -0,0 +1,51 @@
++#include <cstdlib>
++#include <iostream>
++#include <limits>
++#include "robo_hardware/sensor_clock.hpp"
++#include "../../../firmware/mega_mecanum_temporal/sliding_scan.h"
++#define CHECK(x) do { ++checks; if (!(x)) {std::cerr << __LINE__ << ": " #x "\n"; return 1;} } while (0)
++int main() {
++  int checks = 0;
++  CHECK(robo_hardware::valid_command_stamp(1000000000,1100000000,.25));
++  CHECK(!robo_hardware::valid_command_stamp(1000000000,1300000000,.25));
++  CHECK(!robo_hardware::valid_command_stamp(1200000000,1100000000,.25));
++  CHECK(!robo_hardware::valid_command_stamp(0,1100000000,.25));
++  CHECK(!robo_hardware::valid_command_stamp(-1,1100000000,.25));
++  CHECK(!robo_hardware::valid_command_stamp(1000000000,1100000000,-1));
++  SlidingScan180 scan;
++  CHECK(scan.value(0,1000)==0);
++  scan.sample(0,1000,10000); scan.sample(0,900,10000);
++  CHECK(scan.value(0,11000)==900);
++  scan.sample(0,0,12000);
++  CHECK(scan.value(0,13000)==0);
++  scan.sample(0,800,14000); scan.sample(1,700,15000);
++  CHECK(scan.oldest(20000)==14000);
++  CHECK(scan.value(0,300000)==0);
++  scan.expire(300000);
++  CHECK(scan.value(0,14001)==0);  // depois de uma volta inteira do relogio nao ressuscita
++  scan.sample(0,700,0xffffff00U);
++  CHECK(scan.value(0,0x10U)==700);
++  CHECK(scan.oldest(0x10U)==0xffffff00U);
++  robo_hardware::SensorClock c;
++  double age = 0, uncertainty = 0;
++  CHECK(!c.oldest(10, 0, 0, 0, 100, 0, age, uncertainty));
++  CHECK(c.anchor(10, 10.02, 1000000));
++  CHECK(c.oldest(10.1, 950000, 980000, 990000, 1000, 0.01, age, uncertainty));
++  CHECK(age >= 0.16 && age < 0.161);
++  CHECK(uncertainty >= 0.03);
++  CHECK(!c.oldest(10.1, 950000, 980000, 990000, -1, 0.01, age, uncertainty));
++  CHECK(!c.oldest(10.1, 950000, 980000, 990000, 1000, -1, age, uncertainty));
++  CHECK(!c.oldest(10.7, 950000, 980000, 990000, 1000, 0.01, age, uncertainty));
++  CHECK(!c.oldest(11.2, 1100000, 1150000, 1190000, 1000, 0.01, age, uncertainty));
++  CHECK(!c.oldest(10.1, 980000, 950000, 990000, 1000, 0.01, age, uncertainty));
++  CHECK(!c.oldest(10.1, 950000, 990000, 980000, 1000, 0.01, age, uncertainty));
++  CHECK(!c.oldest(10.1, 950000, 980000, 990000, std::numeric_limits<double>::quiet_NaN(), 0, age, uncertainty));
++  CHECK(!c.anchor(10, 9, 0));
++  CHECK(!c.anchor(10, 10.31, 0));
++  CHECK(c.anchor(20, 20.01, 0xfffffff0U));
++  CHECK(c.oldest(20.1, 0xffffff00U, 0x10U, 0x20U, 1000, 0, age, uncertainty));
++  CHECK(age > 0.1);
++  c.reset();
++  CHECK(!c.oldest(20.1, 0xffffff00U, 0x10U, 0x20U, 1000, 0, age, uncertainty));
++  std::cout << "sensor_clock: " << checks << " checks passed\n";
++}
+--- a/src/robo_lidar/launch/lidar_filter.launch.py
++++ b/src/robo_lidar/launch/lidar_filter.launch.py
+@@ -1,4 +1,5 @@
+ from pathlib import Path
++import yaml
+ 
+ from ament_index_python.packages import get_package_share_directory
+ from launch import LaunchDescription
+@@ -10,6 +11,11 @@
+ def generate_launch_description():
+     package_share = Path(get_package_share_directory("robo_lidar"))
+     parameters = package_share / "config" / "lidar.yaml"
++
++    with open(parameters) as fp:
++        temporal_parameters = yaml.safe_load(fp)['scan_filter']['ros__parameters']
++    temporal_parameters = dict(temporal_parameters, input_topic='/scan_raw_temporal',
++                               output_topic='/scan_temporal_front')
+ 
+     lidar_x = LaunchConfiguration("lidar_x")
+     lidar_y = LaunchConfiguration("lidar_y")
+@@ -54,6 +60,8 @@
+                     "--child-frame-id", "laser_raw",
+                 ],
+             ),
++            Node(package='robo_lidar', executable='scan_filter_node',
++                 name='scan_filter_temporal', output='screen', parameters=[temporal_parameters]),
+             Node(
+                 package="robo_lidar",
+                 executable="scan_filter_node",
+--- a/src/robo_lidar/package.xml
++++ b/src/robo_lidar/package.xml
+@@ -13,6 +13,7 @@
+   <exec_depend>launch</exec_depend>
+   <exec_depend>launch_ros</exec_depend>
+   <exec_depend>rclpy</exec_depend>
++  <exec_depend>python3-yaml</exec_depend>
+   <exec_depend>sensor_msgs</exec_depend>
+   <exec_depend>tf2_ros</exec_depend>
+ 
+--- a/src/robo_navigation/CMakeLists.txt
++++ b/src/robo_navigation/CMakeLists.txt
+@@ -11,6 +11,7 @@
+ if(BUILD_TESTING)
+   find_package(ament_cmake_pytest REQUIRED)
+   ament_add_pytest_test(giro_frontal test/test_giro_frontal.py)
++  ament_add_pytest_test(giro_integrado test/test_integrado_t.py TIMEOUT 120)
+ endif()
+ 
+ ament_package()
+--- a/src/robo_navigation/package.xml
++++ b/src/robo_navigation/package.xml
+@@ -36,4 +36,7 @@
+   <exec_depend>std_srvs</exec_depend>
+   <exec_depend>std_msgs</exec_depend>
+   <exec_depend>geometry_msgs</exec_depend>
++  <exec_depend>rcl_interfaces</exec_depend>
++  <exec_depend>lifecycle_msgs</exec_depend>
++  <exec_depend>python3-yaml</exec_depend>
+ </package>
+--- a/src/robo_navigation/config/nav2_params.yaml
++++ b/src/robo_navigation/config/nav2_params.yaml
+@@ -328,6 +328,7 @@
+ 
+     polygons:
+     - VelocityPolygonStop
++    - SweptTurnStop
+ 
+     VelocityPolygonStop:
+       type: velocity_polygon
+@@ -433,6 +434,42 @@
+         theta_min: -0.60
+         theta_max: -0.20
+ 
++    # Envelope circunscrito (nao inscrito) aos cantos + 5 cm.
++    # Ativado pelo launch SOMENTE no modo experimental. Inclui giros combinados.
++    SweptTurnStop:
++      type: velocity_polygon
++      action_type: stop
++      min_points: 1
++      visualize: true
++      polygon_pub_topic: collision_monitor_swept_turn
++      enabled: false
++      holonomic: true
++      velocity_polygons: [left_turn, right_turn, quiet]
++      left_turn:
++        points: "[[0.532131, 0.105847], [0.451119, 0.301428], [0.301428, 0.451119], [0.105847, 0.532131], [-0.105847, 0.532131], [-0.301428, 0.451119], [-0.451119, 0.301428], [-0.532131, 0.105847], [-0.532131, -0.105847], [-0.451119, -0.301428], [-0.301428, -0.451119], [-0.105847, -0.532131], [0.105847, -0.532131], [0.301428, -0.451119], [0.451119, -0.301428], [0.532131, -0.105847]]"
++        linear_min: 0.0
++        linear_max: 0.35
++        direction_start_angle: -3.141592653589793
++        direction_end_angle: 3.141592653589793
++        theta_min: 0.015
++        theta_max: 0.6
++      right_turn:
++        points: "[[0.532131, 0.105847], [0.451119, 0.301428], [0.301428, 0.451119], [0.105847, 0.532131], [-0.105847, 0.532131], [-0.301428, 0.451119], [-0.451119, 0.301428], [-0.532131, 0.105847], [-0.532131, -0.105847], [-0.451119, -0.301428], [-0.301428, -0.451119], [-0.105847, -0.532131], [0.105847, -0.532131], [0.301428, -0.451119], [0.451119, -0.301428], [0.532131, -0.105847]]"
++        linear_min: 0.0
++        linear_max: 0.35
++        direction_start_angle: -3.141592653589793
++        direction_end_angle: 3.141592653589793
++        theta_min: -0.6
++        theta_max: -0.015
++      quiet:
++        points: "[[0.375, 0.325], [0.375, -0.325], [-0.215, -0.325], [-0.215, 0.325]]"
++        linear_min: 0.0
++        linear_max: 0.35
++        direction_start_angle: -3.141592653589793
++        direction_end_angle: 3.141592653589793
++        theta_min: -0.6
++        theta_max: 0.6
++
+     observation_sources:
+     - scan
+     scan:
+--- a/src/robo_navigation/launch/navigation.launch.py
++++ b/src/robo_navigation/launch/navigation.launch.py
+@@ -6,7 +6,8 @@
+ from launch import LaunchDescription
+ from launch.actions import DeclareLaunchArgument, RegisterEventHandler, TimerAction, ExecuteProcess
+ from launch.event_handlers import OnProcessStart
+-from launch.substitutions import LaunchConfiguration
++from launch.substitutions import LaunchConfiguration, PythonExpression
++from launch_ros.parameter_descriptions import ParameterValue
+ from launch_ros.actions import Node
+ 
+ 
+@@ -94,8 +95,8 @@
+ 
+     return LaunchDescription(
+         [
+-            DeclareLaunchArgument("atraso_lidar_pre_stamp_max_t", default_value="-1.0"),
+-            DeclareLaunchArgument("atraso_imu_pre_stamp_max_t", default_value="-1.0"),
++            DeclareLaunchArgument("limite_vel_angular_real_t", default_value="-1.0"),
++            DeclareLaunchArgument("limite_vel_linear_real_t", default_value="-1.0"),
+             DeclareLaunchArgument("modo_curva_t", default_value="lateral",
+                                   choices=["lateral", "giro_frontal"]),
+             DeclareLaunchArgument(
+@@ -180,7 +181,11 @@
+                 executable="collision_monitor",
+                 name="collision_monitor",
+                 output="screen",
+-                parameters=common_parameters,
++                parameters=common_parameters + [{
++                    "stop_pub_timeout": ParameterValue(PythonExpression([
++                        "86400.0 if '", modo_curva_t, "' == 'giro_frontal' else 2.0"]), value_type=float),
++                    "SweptTurnStop.enabled": ParameterValue(
++                        PythonExpression(["'", modo_curva_t, "' == 'giro_frontal'"]), value_type=bool)}],
+                 # Parametros fazem /cmd_vel_smoothed -> /cmd_vel.
+                 remappings=common_remappings,
+             ),
+@@ -196,17 +201,17 @@
+             ),
+             ExecuteProcess(
+                 cmd=["python3", os.path.expanduser(
+-                    "~/robo_jazzy_ws/src/robo_navigation/scripts/arbitro_t.py")],
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/arbitro_t.py"),
++                     "--ros-args", "-p", ["heartbeat_parado:=", PythonExpression([
++                         "'true' if '", modo_curva_t, "' == 'giro_frontal' else 'false'"])]],
+                 output="screen",
+             ),
+             ExecuteProcess(  # NAV_TUDO: alinhador: passagens, mesas, START/FINISH
+                 cmd=["python3", os.path.expanduser(
+                     "~/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py"),
+                      "--ros-args", "-p", ["modo_curva_t:=", modo_curva_t],
+-                     "-p", ["atraso_lidar_pre_stamp_max_t:=",
+-                            LaunchConfiguration("atraso_lidar_pre_stamp_max_t")],
+-                     "-p", ["atraso_imu_pre_stamp_max_t:=",
+-                            LaunchConfiguration("atraso_imu_pre_stamp_max_t")]],
++                     "-p", ["limite_vel_angular_real_t:=", LaunchConfiguration("limite_vel_angular_real_t")],
++                     "-p", ["limite_vel_linear_real_t:=", LaunchConfiguration("limite_vel_linear_real_t")]],
+                 output="screen",
+             ),
+             ExecuteProcess(  # SUAVIZADOR_NAV: /cmd_vel_ctrl -> /cmd_vel_nav
+--- a/src/robo_navigation/scripts/alinhador_passagem.py
++++ b/src/robo_navigation/scripts/alinhador_passagem.py
+@@ -182,6 +182,7 @@
+     python3 alinhador_passagem.py
+     python3 alinhador_passagem.py --ros-args -p modo_travessia:=nav2   (comportamento v2)
+ """
++import json
+ import collections
+ import heapq  # ROTA_MAPA
+ import math
+@@ -189,7 +190,7 @@
+ import threading
+ import time
+ from giro_frontal import (GiroFrontal, TempoSensor, Observacao, avaliar_varredura,
+-                          devolver_controle)
++                          devolver_controle, envolve_disco)
+ 
+ # ---------------------------------------------------------------------------
+ # Nucleo geometrico (sem ROS: pode ser testado fora do robo)
+@@ -2230,7 +2231,8 @@
+     from nav2_msgs.msg import CollisionMonitorState
+     from sensor_msgs.msg import Imu, LaserScan  # SENSOR_PARADO
+     from std_msgs.msg import String, Bool
+-    from std_srvs.srv import SetBool
++    from std_srvs.srv import SetBool, Trigger
++    from rcl_interfaces.srv import GetParameters
+     from tf2_ros import Buffer, TransformListener
+ 
+     def yaw_de(q):
+@@ -2255,10 +2257,10 @@
+             # v3: travessia pelo LiDAR ('lidar') ou pelo Nav2 como na v2 ('nav2')
+             self.declare_parameter('modo_travessia', 'lidar')
+             self.declare_parameter('modo_curva_t', 'lateral')
+-            # Driver carimba na PUBLICACAO. -1 = atraso anterior desconhecido:
+-            # experimental bloqueado ate obter limites confiaveis, nunca adivinhar.
+-            self.declare_parameter('atraso_lidar_pre_stamp_max_t', -1.0)
+-            self.declare_parameter('atraso_imu_pre_stamp_max_t', -1.0)
++            self.declare_parameter('limite_vel_angular_real_t', -1.0)
++            self.declare_parameter('limite_vel_linear_real_t', -1.0)
++            self.declare_parameter('topico_scan_temporal_t', '/scan_temporal_front')
++            self.declare_parameter('topico_imu_temporal_t', '/imu/data_temporal')
+             if self.get_parameter('modo_curva_t').value not in ('lateral', 'giro_frontal'):
+                 raise ValueError('modo_curva_t deve ser lateral ou giro_frontal')
+             self.declare_parameter('sensor_idade_max', 0.5)     # SENSOR_PARADO
+@@ -2321,9 +2323,16 @@
+             self.imu_t = None
+             self.scan_t_raw = None
+             self.controle_t_ativo = False
++            self.cancelamento_t = threading.Event()
+             self.conflito_t = (0.0, True)
+             self.t_imu = None   # SENSOR_PARADO
+             self.gyro_z = 0.0
++            self.create_subscription(Imu, self.p('topico_imu_temporal_t'),
++                                     lambda msg: self.ao_imu(msg, experimental=True),
++                                     qos_profile_sensor_data, callback_group=grupo)
++            self.create_subscription(LaserScan, self.p('topico_scan_temporal_t'),
++                                     lambda msg: self.ao_scan(msg, experimental=True),
++                                     qos_profile_sensor_data, callback_group=grupo)
+             self.create_subscription(Imu, '/imu/data', self.ao_imu, qos_profile_sensor_data,
+                                      callback_group=grupo)
+             self.create_subscription(Odometry, '/odom', self.ao_odom, 20, callback_group=grupo)
+@@ -2336,6 +2345,11 @@
+             self.pub_cmd = self.create_publisher(TwistStamped, '/cmd_vel_nav', 10)
+             self.pub_t = self.create_publisher(TwistStamped, '/cmd_vel_nav_t', 10)
+             self.controle_t = self.create_client(SetBool, '/alinhador/controle_t', callback_group=grupo)
++            self.cm_params_t = self.create_client(GetParameters, '/collision_monitor/get_parameters', callback_group=grupo)
++            self.hw_params_t = self.create_client(GetParameters, '/robo_hardware/get_parameters', callback_group=grupo)
++            self.pub_estado_t = self.create_publisher(String, '/alinhador/estado_t', 20)
++            self.create_subscription(String, '/hardware/sensor_timing', self.ao_timing_t, 20, callback_group=grupo)
++            self.create_service(Trigger, '/alinhador/cancelar_t', self.cancelar_t, callback_group=grupo)
+             self.create_subscription(Bool, '/alinhador/conflito_t', self.ao_conflito_t, 10,
+                                      callback_group=grupo)
+             # v3.31 ANTI_CISCADO: historico do comando do Nav2 e da odom; cliente do destravar
+@@ -2390,26 +2404,69 @@
+ 
+         def _tempo_sensor_t(self, msg, sensor, atraso=0.0):
+             with self.lock:
++                ros_ns, mono = self.get_clock().now().nanoseconds, time.monotonic()
++                # Janela LiDAR deslizante pode manter o mesmo raio mais antigo.
++                # Reutiliza exatamente o prazo original; nunca renova na recepcao.
++                anterior = self.tempos_t.get(sensor)
++                stamp_ns = msg.header.stamp.sec*1000000000+msg.header.stamp.nanosec
++                if sensor == 'lidar' and anterior is not None and anterior.stamp_ns == stamp_ns:
++                    amostra = anterior if anterior.recente(ros_ns, mono) else None
++                    self.tempos_t[sensor] = amostra
++                    return amostra
+                 amostra = TempoSensor.receber(msg.header.stamp,
+-                    self.get_clock().now().nanoseconds, time.monotonic(), atraso,
++                    ros_ns, mono, atraso,
+                     self.ultimos_stamps_t.get(sensor))
+                 self.tempos_t[sensor] = amostra
+                 if amostra is not None:
+                     self.ultimos_stamps_t[sensor] = amostra.stamp_ns
+             return amostra
+ 
+-        def ao_imu(self, msg):   # SENSOR_PARADO
++        def ao_timing_t(self, msg):
++            try:
++                item = json.loads(msg.data)
++                if not isinstance(item, dict):
++                    raise ValueError('metadata temporal sem objeto')
++                if not item.get('timed_frame') or item.get('valid'):
++                    return
++                sensors = [item.get('sensor')]
++            except (ValueError, TypeError):
++                sensors = ['lidar', 'imu']
++            with self.lock:
++                for sensor in sensors:
++                    if sensor in ('lidar', 'imu'):
++                        self.tempos_t[sensor] = None
++                        if sensor == 'lidar':
++                            self.scan_t_raw = None
++                        else:
++                            self.imu_t = None
++
++        def cancelar_t(self, req, res):
++            self.cancelamento_t.set()
++            self._cancelar_nav()
++            res.success, res.message = True, 'cancelamento solicitado; aguarde estado parado'
++            return res
++
++        def _estado_t(self, estado, motivo='', observacao=None):
++            m = String()
++            m.data = json.dumps(dict(estado=estado, motivo=motivo,
++                                    observacao=observacao, stamp_ns=self.get_clock().now().nanoseconds))
++            self.pub_estado_t.publish(m)
++
++        def ao_imu(self, msg, experimental=False):   # SENSOR_PARADO
++            if not experimental:
++                self.t_imu = time.monotonic()
++                self.gyro_z = msg.angular_velocity.z
++                return
+             q = msg.orientation
+             valores = (q.x, q.y, q.z, q.w, msg.angular_velocity.z)
+-            amostra = self._tempo_sensor_t(msg, 'imu', self.p('atraso_imu_pre_stamp_max_t'))
++            amostra = self._tempo_sensor_t(msg, 'imu', 0.0)
+             valida = (amostra is not None
+                       and msg.orientation_covariance[0] != -1
+                       and all(math.isfinite(v) for v in valores)
+                       and abs(sum(v*v for v in valores[:4])-1.0) < 0.05)
+             with self.lock:
+                 self.imu_t = (amostra.aquisicao_mono, yaw_de(q), msg.angular_velocity.z) if valida else None
+-            self.t_imu = time.monotonic()
+-            self.gyro_z = msg.angular_velocity.z   # ANGULO_FUNDIDO
++
+ 
+         def ao_plano(self, msg):
+             with self.lock:
+@@ -2497,23 +2554,14 @@
+         def ao_cm(self, msg):
+             self.cm_stop = msg.action_type == 1  # STOP
+ 
+-        def ao_scan(self, msg):
+-            # A ordem angular dos bins nao representa a ordem de aquisicao do
+-            # driver. Usa a idade do raio MAIS ANTIGO, sem deskew ficticio.
+-            duracao = getattr(msg, 'scan_time', math.nan)
+-            incremento = getattr(msg, 'time_increment', math.nan)
+-            n = len(getattr(msg, 'ranges', ()))
+-            atraso = self.p('atraso_lidar_pre_stamp_max_t')
+-            if (not math.isfinite(duracao) or not 0.05 <= duracao <= 1.0
+-                    or not math.isfinite(incremento) or incremento <= 0 or n < 3
+-                    or abs(incremento*n-duracao) > 0.05*duracao or atraso < 0):
+-                atraso = math.nan
+-            else:
+-                atraso += max(duracao, incremento*(n-1))
+-            amostra = self._tempo_sensor_t(msg, 'lidar', atraso)
++        def ao_scan(self, msg, experimental=False):
++            # Fluxo temporal ja carrega limite inferior de aquisicao na ponte.
++            # Nao somar scan_time novamente; bins agregados tem time_increment=0.
++            amostra = self._tempo_sensor_t(msg, 'lidar', 0.0) if experimental else None
+             if not self._stamp_recente(msg.header.stamp):
+-                with self.lock:
+-                    self.scan_t_raw = None
++                if experimental:
++                    with self.lock:
++                        self.scan_t_raw = None
+                 return
+             if self.laser_tf is None:
+                 try:
+@@ -2535,15 +2583,17 @@
+             frente = min([p[0] - 0.365 for p in pts if p[0] > 0.30 and abs(p[1]) < 0.33] or [9.0])
+             with self.lock:
+                 od = self.odom
+-                self.scan_t_raw = ((amostra.aquisicao_mono, tuple(msg.ranges), msg.angle_min,
+-                                   msg.angle_increment, msg.range_min, msg.range_max, self.laser_tf)
+-                                   if amostra is not None else None)
+-                self.scan = (time.monotonic(), pts, od[1:] if od else None, frente)
+-                self.scan_seq += 1
++                if experimental:
++                    self.scan_t_raw = ((amostra.aquisicao_mono, tuple(msg.ranges), msg.angle_min,
++                                       msg.angle_increment, msg.range_min, msg.range_max, self.laser_tf)
++                                       if amostra is not None else None)
++                else:
++                    self.scan = (time.monotonic(), pts, od[1:] if od else None, frente)
++                    self.scan_seq += 1
+ 
+         def _novo_goal_chegou(self):
+             with self.lock:
+-                return self.goal_pendente is not None
++                return self.goal_pendente is not None or self.cancelamento_t.is_set()
+ 
+         # ---------------- utilidades ----------------
+         def _esperar(self, futuro, timeout):
+@@ -3224,7 +3274,14 @@
+                         od, sc, sq, cf = self.odom, self.scan, self.scan_seq, self.cmd_final
+                     trav.entrada_rapida = self.p('entrada_rapida')
+                     trav.uma_parede = self.p('uma_parede')
+-                    pausa = self._esperar_sensores(nome)   # SENSOR_PARADO
++                    if self.controle_t_ativo:
++                        if (not self._precondicoes_t() or self.cm_stop or self.conflito_t[1]
++                                or agora-self.conflito_t[0] > 0.3 or agora-cf[0] > 0.3):
++                            trav.abortar('aproximacao experimental sem sensores/protecao/conflito')
++                            break
++                        pausa = 0.0
++                    else:
++                        pausa = self._esperar_sensores(nome)   # SENSOR_PARADO
+                     if pausa > 0.0:
+                         with self.lock:
+                             od = self.odom
+@@ -3253,7 +3310,10 @@
+                             x_esp = restante + self.p('centro_corpo') + (trav.largura_b or trav.largura or 0.82) / 2.0
+                             trav.nova_transversal(sc[0], medir_parede_a_frente(
+                                 sc[1], lado, x_max=max(0.6, x_esp + 0.35)), sc[2])
+-                    pm = self._pose_mapa()
++                    pm = (self._pose_mapa_yaw(idade_max=0.3) if self.controle_t_ativo else self._pose_mapa())
++                    if pm is None and self.controle_t_ativo:
++                        trav.abortar('TF ausente/desatualizada na aproximacao experimental')
++                        break
+                     if pm is None:
+                         sem_tf_desde = sem_tf_desde or agora
+                         if agora - sem_tf_desde > 1.0:
+@@ -3283,7 +3343,7 @@
+             finally:
+                 self._parar()
+             ok = trav.estado == 'fim'
+-            if not ok and trav.p_aprox_odom is not None:
++            if not ok and not self.controle_t_ativo and trav.p_aprox_odom is not None:
+                 # se entrou na passagem, sai de re reto (mesmo eixo) antes de qualquer outra coisa
+                 with self.lock:
+                     od = self.odom
+@@ -3300,18 +3360,119 @@
+             with self.lock:
+                 tempos, raw = dict(self.tempos_t), self.scan_t_raw
+             agora, ros_ns = time.monotonic(), self.get_clock().now().nanoseconds
+-            return (all(tempos.get(sensor) is not None
++            return (math.isfinite(self.p('limite_vel_angular_real_t'))
++                    and self.p('limite_vel_angular_real_t') >= 0.10
++                    and math.isfinite(self.p('limite_vel_linear_real_t'))
++                    and self.p('limite_vel_linear_real_t') >= 0.03
++                    and all(tempos.get(sensor) is not None
+                         and tempos[sensor].recente(ros_ns, agora)
+                         for sensor in ('lidar', 'imu', 'odom'))
+-                    and raw is not None and len(raw[1]) >= 720
+-                    and 0 < abs(raw[3]) <= math.radians(0.5)+1e-8
++                    and raw is not None and len(raw[1]) >= 3
++                    and all(math.isfinite(r) and raw[4] <= r <= raw[5] for r in raw[1])
++                    and 0 < abs(raw[3]) < math.pi/2
++                    and (math.hypot(0.365, 0.315)+0.05+math.hypot(*raw[6][:2]))
++                        *math.sin(abs(raw[3])) <= 0.05
+                     and abs(abs(raw[3])*len(raw[1])-2*math.pi) <= 1e-5)
++
++        def _verificar_cm_t(self):
++            # Nao permitir correcao angular adicional DEPOIS do Collision Monitor.
++            if not self.hw_params_t.wait_for_service(timeout_sec=1.0):
++                return False
++            hw_req = GetParameters.Request()
++            hw_req.names = ['heading_hold_enabled', 'command_authority']
++            hw = self._esperar(self.hw_params_t.call_async(hw_req), 1.0)
++            if (hw is None or len(hw.values) != 2 or hw.values[0].type != 1 or hw.values[0].bool_value
++                    or hw.values[1].string_value != 'collision_monitor'):
++                return False
++            if not self.cm_params_t.wait_for_service(timeout_sec=1.0):
++                return False
++            req = GetParameters.Request()
++            req.names = ['polygons', 'SweptTurnStop.enabled', 'SweptTurnStop.min_points',
++                         'cmd_vel_in_topic', 'cmd_vel_out_topic']
++            for name in ('left_turn', 'right_turn'):
++                req.names += ['SweptTurnStop.'+name+'.'+key for key in
++                    ('points', 'linear_min', 'linear_max', 'theta_min', 'theta_max',
++                     'direction_start_angle', 'direction_end_angle')]
++            r = self._esperar(self.cm_params_t.call_async(req), 1.0)
++            if r is None or len(r.values) != len(req.names):
++                return False
++            try:
++                for i, direction in ((5, 1), (12, -1)):
++                    v = r.values[i:i+7]
++                    if (not envolve_disco(json.loads(v[0].string_value), math.hypot(.365,.315)+.05)
++                            or v[1].double_value > 0 or v[2].double_value < math.hypot(.2,.16)
++                            or v[3].double_value > (0.015 if direction > 0 else -0.6)
++                            or v[4].double_value < (0.6 if direction > 0 else -0.015)
++                            or v[5].double_value > -math.pi or v[6].double_value < math.pi):
++                        return False
++            except (ValueError, TypeError):
++                return False
++            return ('SweptTurnStop' in r.values[0].string_array_value
++                    and r.values[1].bool_value and r.values[2].integer_value == 1
++                    and r.values[3].string_value.lstrip('/') == 'cmd_vel_smoothed'
++                    and r.values[4].string_value.lstrip('/') == 'cmd_vel')
+ 
+         def _arbitro_exclusivo(self):
+             saidas = self.get_publishers_info_by_topic('/cmd_vel_nav_seguro')
+             entradas = self.get_publishers_info_by_topic('/cmd_vel_nav_t')
+             return (len(saidas) == 1 and saidas[0].node_name == 'arbitro_t'
+-                    and len(entradas) == 1 and entradas[0].node_name == self.get_name())
++                    and len(entradas) == 1 and entradas[0].node_name == self.get_name()
++                    and all(len(pubs) == 1 and pubs[0].node_name == esperado
++                        for pubs, esperado in ((self.get_publishers_info_by_topic('/cmd_vel_smoothed'), 'velocity_smoother'),
++                                               (self.get_publishers_info_by_topic('/cmd_vel'), 'collision_monitor'))))
++
++        def _adquirir_t(self, gf):
++            if not self.controle_t.wait_for_service(timeout_sec=1.0):
++                gf.abortar('arbitro_t indisponivel; use navigation.launch.py atualizado')
++                return False
++            if not self._arbitro_exclusivo():
++                gf.abortar('topologia de comandos sem exclusividade')
++                return False
++            if not self._verificar_cm_t():
++                gf.abortar('protecao CM/autoridade do hardware/heading_hold nao confirmada')
++                return False
++            # Antes do lease: cancelar e confirmar o resultado terminal do Nav2.
++            h = self.handle_ativo
++            if h is not None:
++                self._esperar(h.cancel_goal_async(), 2.0)
++                r = self._esperar(h.get_result_async(), 3.0)
++                if r is None or r.status not in (4, 5, 6):
++                    gf.abortar('Nav2 nao confirmou parada')
++                    return False
++            req = SetBool.Request()
++            req.data = True
++            # Nao abandonar um futuro de aquisicao pendente por cancelamento:
++            # a resposta deve ser consumida; falhas mantem o bloqueio seguro.
++            f = self.controle_t.call_async(req)
++            limite = time.monotonic()+2.0
++            while not f.done() and time.monotonic() < limite:
++                time.sleep(0.02)
++            if not f.done():
++                gf.abortar('timeout do arbitro')
++                # Aquisicao tardia fica bloqueada pelo watchdog ate reset manual.
++                return False
++            adquirido = f.result().success
++            if not adquirido:
++                gf.abortar('outro controlador ativo')
++                return False
++            self.controle_t_ativo = True
++            return True
++
++        def _aproximar_t(self, info, curva, nome, parada, largura_b):
++            guarda = GiroFrontal(curva['juncao'], curva['eixo_b'], curva['saida_b'])
++            ok = False
++            try:
++                if not self._adquirir_t(guarda):
++                    return 'falha'
++                self._estado_t('aproximar_centro')
++                r = self._travessia_lidar(info, nome, parada, None, largura_b)
++                ok = r == 'ok'
++                return r
++            finally:
++                if not ok:
++                    self._parar()
++                    self.controle_t_ativo = False
++                    self._estado_t('abortar', guarda.motivo or 'aproximacao interrompida; watchdog estaciona')
+ 
+         def _travessia_giro_frontal(self, curva, nome):
+             """Lease exclusivo; todas as falhas terminam em zero, sem fallback lateral."""
+@@ -3319,37 +3480,10 @@
+                              margem=self.p('margem_saida_lateral'))
+             adquirido = False
+             try:
+-                if not self.controle_t.wait_for_service(timeout_sec=1.0):
+-                    gf.abortar('arbitro_t indisponivel; use navigation.launch.py atualizado')
++                adquirido = getattr(self, 'controle_t_ativo', False) or self._adquirir_t(gf)
++                if not adquirido:
+                     return 'falha'
+-                if not self._arbitro_exclusivo():
+-                    gf.abortar('topologia de comandos sem exclusividade')
+-                    return 'falha'
+-                # Antes do lease: cancelar e confirmar o resultado terminal do Nav2.
+-                h = self.handle_ativo
+-                if h is not None:
+-                    self._esperar(h.cancel_goal_async(), 2.0)
+-                    r = self._esperar(h.get_result_async(), 3.0)
+-                    if r is None or r.status not in (4, 5, 6):
+-                        gf.abortar('Nav2 nao confirmou parada')
+-                        return 'falha'
+-                req = SetBool.Request()
+-                req.data = True
+-                # Nao abandonar um futuro de aquisicao pendente por cancelamento:
+-                # a resposta deve ser consumida; falhas mantem o bloqueio seguro.
+-                f = self.controle_t.call_async(req)
+-                limite = time.monotonic()+2.0
+-                while not f.done() and time.monotonic() < limite:
+-                    time.sleep(0.02)
+-                if not f.done():
+-                    gf.abortar('timeout do arbitro')
+-                    # Aquisicao tardia fica bloqueada pelo watchdog ate reset manual.
+-                    return 'falha'
+-                adquirido = f.result().success
+-                if not adquirido:
+-                    gf.abortar('outro controlador ativo')
+-                    return 'falha'
+-                self.controle_t_ativo = True
++                self._estado_t('parar')
+                 self._parar()
+                 while rclpy.ok():
+                     with self.lock:
+@@ -3364,8 +3498,16 @@
+                     # em 5 cm e mais 12 cm a frente para latencia/frenagem.
+                     raio = math.hypot(0.365, 0.315)+0.05
+                     caixa = (-0.255, 0.535, -0.365, 0.365) if gf.estado == 'avancar' else None
+-                    observacao = (avaliar_varredura(*raw[1:], raio, caixa=caixa)
+-                                  if raw is not None else Observacao.DESCONHECIDA)
++                    omega_max = self.p('limite_vel_angular_real_t')
++                    v_max = self.p('limite_vel_linear_real_t')
++                    idade = max(0.0, time.monotonic()-raw[0]) if raw else math.inf
++                    dentro_limites = (math.isfinite(omega_max) and omega_max >= 0.10
++                                      and math.isfinite(v_max) and v_max >= 0.03
++                                      and imu is not None and abs(imu[2]) <= omega_max)
++                    observacao = (avaliar_varredura(*raw[1:], raio, caixa=caixa,
++                                      movimento_angular=omega_max*idade,
++                                      movimento_linear=v_max*idade)
++                                  if raw is not None and dentro_limites else Observacao.DESCONHECIDA)
+                     agora = time.monotonic()
+                     ros_ns = self.get_clock().now().nanoseconds
+                     recentes = all(tempos.get(nome_sensor) is not None
+@@ -3381,6 +3523,7 @@
+                                    cancelado=self._novo_goal_chegou(),
+                                    bloqueado=(self.cm_stop or conflito[1] or agora-conflito[0] > 0.3
+                                               or agora-cf[0] > 0.3 or not self._arbitro_exclusivo()))
++                    self._estado_t(gf.estado, gf.motivo, observacao.value)
+                     self._publicar_vel(*cmd)
+                     if gf.estado in ('fim', 'abortar'):
+                         break
+@@ -3390,12 +3533,14 @@
+                 if adquirido and gf.estado == 'fim':
+                     req = SetBool.Request()
+                     req.data = False
++                    self._estado_t('devolvendo')
+                     confirmado, motivo = devolver_controle(self.controle_t, req,
+                         lambda: self._publicar_vel(0.0, 0.0, 0.0))
+                     if not confirmado:
+                         gf.abortar(motivo)
+                 # Em falha, watchdog estaciona o arbitro sem liberar fontes normais.
+                 self.controle_t_ativo = False
++                self._estado_t(gf.estado, gf.motivo)
+                 self.get_logger().info('%s giro frontal: %s %s' % (nome, gf.estado, gf.motivo))
+             return 'ok' if gf.estado == 'fim' else 'falha'
+ 
+@@ -3606,6 +3751,7 @@
+                     self.evento.clear()
+                 if goal is None:
+                     continue
++                self.cancelamento_t.clear()
+                 try:
+                     if self.encostado:
+                         # de frente para a mesa a 8 cm, girar bate a quina: sai de re reto antes
+@@ -3702,7 +3848,7 @@
+                             and not self._precondicoes_t()):
+                         self._parar()
+                         self.get_logger().error('Curva experimental recusada antes do preparo: '
+-                            'idade de aquisicao desconhecida/antiga ou resolucao LiDAR insuficiente')
++                            'temporalidade, limites reais de movimento ou cobertura angular insuficientes')
+                         return
+                     ok = self._chegar_preparo(e, 'PREPARO %d (alinhar fora da passagem)' % len(tratadas)) == 'ok'
+                     if ok:
+@@ -3753,7 +3899,14 @@
+                         lado_c = curva['lado'] if curva is not None else None
+                         larg_b = curva.get('largura_b') if curva is not None else None
+                         lado_parada = None if self.p('modo_curva_t') == 'giro_frontal' else lado_c
+-                        r = self._travessia_lidar(info, 'TRAVESSIA %d' % n, parada, lado_parada, larg_b)
++                        experimental_t = curva is not None and self.p('modo_curva_t') == 'giro_frontal'
++                        if experimental_t:
++                            r = self._aproximar_t(info, curva, 'TRAVESSIA %d' % n, parada, larg_b)
++                            if r != 'ok':
++                                self.get_logger().error('Aproximacao experimental interrompida, sem retentativa automatica')
++                                return
++                        else:
++                            r = self._travessia_lidar(info, 'TRAVESSIA %d' % n, parada, lado_parada, larg_b)
+                         if r != 'ok':
+                             self.get_logger().warn('Travessia pelo LiDAR falhou: voltando ao preparo '
+                                                    'para tentar de novo.')
+--- a/src/robo_navigation/scripts/giro_frontal.py
++++ b/src/robo_navigation/scripts/giro_frontal.py
+@@ -17,24 +17,29 @@
+     DESCONHECIDA = 'desconhecida'
+ 
+ 
+-def avaliar_varredura(ranges, amin, inc, rmin, rmax, laser, raio, caixa=None):
++def avaliar_varredura(ranges, amin, inc, rmin, rmax, laser, raio, caixa=None,
++                       movimento_angular=0.0, movimento_linear=0.0):
+     """Cobertura por TODOS os raios nativos, sem preencher setores com vizinhos.
+ 
+-    Resolucao maxima de 0,5 grau, fechamento de 360 graus e nenhum raio invalido.
+-    A margem radial de 2,5 cm cobre o espacamento transversal na borda da
+-    regiao atual. Nao e uma prova de ausencia de objetos menores que o feixe.
++    Fechamento de 360 graus e nenhum raio invalido. Bin pode representar um
++    retorno em qualquer angulo de sua celula. A meia lacuna entre dois retornos
++    adjacentes no pior caso (desvio de um bin) deve caber na reserva de 5 cm;
++    esse valor e ADICIONADO a folga, nunca subtraido das margens existentes.
++    Nao comprova detectar objetos menores que a lacuna entre feixes.
+     Obstaculo tem precedencia sobre desconhecido; infinito nao prova espaco livre.
+     """
+     lx, ly, yaw = laser
+     if not all(math.isfinite(v) for v in (amin, inc, rmin, rmax, lx, ly, yaw, raio)):
++        return Observacao.DESCONHECIDA
++    if (not math.isfinite(movimento_angular) or movimento_angular < 0 or
++            not math.isfinite(movimento_linear) or movimento_linear < 0):
+         return Observacao.DESCONHECIDA
+     if (len(ranges) < 3 or inc == 0
+             or rmin < 0 or rmax <= rmin or math.hypot(lx, ly) >= raio):
+         return Observacao.DESCONHECIDA
+     # Cobertura deve fechar uma volta, permitindo apenas a celula do ultimo raio.
+     cobertura = abs(inc)*len(ranges)
+-    desconhecida = (abs(cobertura-2*math.pi) > 1e-5
+-                    or abs(inc) > math.radians(0.5)+1e-8)
++    desconhecida = abs(cobertura-2*math.pi) > 1e-5 or abs(inc) >= math.pi/2
+     if caixa is not None:
+         xmin, xmax, ymin, ymax = caixa
+         if not xmin < lx < xmax or not ymin < ly < ymax:
+@@ -49,15 +54,41 @@
+             tx = ((xmax if c > 0 else xmin)-lx)/c if abs(c) > 1e-12 else math.inf
+             ty = ((ymax if sn > 0 else ymin)-ly)/sn if abs(sn) > 1e-12 else math.inf
+             saida = min(tx, ty)
++        # Sem ordem temporal por bin: o pior fechamento inclui toda a excursao
++        # angular permitida durante a janela, alem da incerteza de binning.
++        lacuna = saida*math.sin(min(abs(inc)+movimento_angular/2, math.pi/2))
++        if lacuna > 0.05:
++            desconhecida = True
+         if not math.isfinite(r) or not rmin <= r <= rmax:
+             desconhecida = True
+-        elif r <= saida+0.025:
++        elif r <= saida+0.025+lacuna+movimento_linear:
+             return Observacao.OBSTACULO
+     return Observacao.DESCONHECIDA if desconhecida else Observacao.LIVRE
+ 
+ 
+ def disco_observado(*args, **kwargs):
+     return avaliar_varredura(*args, **kwargs) is Observacao.LIVRE
++
++
++def fonte_exclusiva(endpoints, gid, esperado='alinhador_passagem'):
++    gid = bytes(gid)
++    return (bool(gid) and any(gid) and len(endpoints) == 1
++            and endpoints[0].node_name == esperado and bytes(endpoints[0].endpoint_gid) == gid)
++
++
++def envolve_disco(points, radius):
++    """Poligono convexo CCW envolvendo um disco; usado na auditoria dos params ativos."""
++    if len(points) < 3 or any(len(p) != 2 or not all(math.isfinite(x) for x in p) for p in points):
++        return False
++    for i, a in enumerate(points):
++        b = points[(i+1)%len(points)]
++        length = math.hypot(b[0]-a[0], b[1]-a[1])
++        if length == 0 or (a[0]*b[1]-a[1]*b[0])/length < radius-1e-6:
++            return False
++        # Todos os vertices devem estar na mesma meia-regiao de cada aresta.
++        if any((b[0]-a[0])*(p[1]-a[1])-(b[1]-a[1])*(p[0]-a[0]) < -1e-6 for p in points):
++            return False
++    return True
+ 
+ 
+ @dataclass(frozen=True)
+@@ -225,6 +256,9 @@
+         return True
+ 
+     def normal(self, t, cmd):
++        if not all(math.isfinite(v) for v in cmd):
++            self.falha, self.estacionado, self.ativo = True, True, False
++            return ZERO
+         if any(abs(v) > 1e-5 for v in cmd):
+             self.ultimo_normal = t
+             if self.ativo:
+@@ -232,6 +266,9 @@
+         return ZERO if self.ativo or self.falha or self.estacionado else cmd
+ 
+     def experimental(self, t, cmd):
++        if not all(math.isfinite(v) for v in cmd):
++            self.falha, self.estacionado, self.ativo = True, True, False
++            return ZERO
+         if not self.ativo:
+             return ZERO
+         self.ultimo_t = t
+--- a/src/robo_navigation/scripts/arbitro_t.py
++++ b/src/robo_navigation/scripts/arbitro_t.py
+@@ -1,26 +1,31 @@
+ #!/usr/bin/env python3
+ """Intertravamento na entrada do velocity_smoother, antes do Collision Monitor."""
+ import time
+-from giro_frontal import ArbitragemT, ZERO
++import json
++from giro_frontal import ArbitragemT, ZERO, fonte_exclusiva
+ 
+ 
+ def main():
+     import rclpy
+     from rclpy.node import Node
+     from geometry_msgs.msg import TwistStamped
+-    from std_msgs.msg import Bool
++    from std_msgs.msg import Bool, String
+     from std_srvs.srv import SetBool, Trigger
+ 
+     class Arbitro(Node):
+         def __init__(self):
+             super().__init__('arbitro_t')
+             self.a = ArbitragemT()
++            self.heartbeat_parado = self.declare_parameter('heartbeat_parado', False).value
++            self.ultimo_input_normal = time.monotonic()
+             self.pub = self.create_publisher(TwistStamped, '/cmd_vel_nav_seguro', 10)
+             self.falha = self.create_publisher(Bool, '/alinhador/conflito_t', 10)
+             self.create_subscription(TwistStamped, '/cmd_vel_nav', self.normal, 10)
+             self.create_subscription(TwistStamped, '/cmd_vel_nav_t', self.experimental, 10)
+             self.create_service(SetBool, '/alinhador/controle_t', self.controle)
+             self.create_service(Trigger, '/alinhador/reset_controle_t', self.resetar)
++            self.pub_estado = self.create_publisher(String, '/arbitro_t/estado', 20)
++            self.create_service(Trigger, '/alinhador/parar_t', self.parar)
+             self.create_timer(0.05, self.tick)
+ 
+         def enviar(self, cmd):
+@@ -35,6 +40,7 @@
+             return m.twist.linear.x, m.twist.linear.y, m.twist.angular.z
+ 
+         def normal(self, m):
++            self.ultimo_input_normal = time.monotonic()
+             cmd = self.a.normal(time.monotonic(), self.cmd(m))
+             # Zeros tardios do Nav2 nao interrompem a realimentacao experimental.
+             if not self.a.ativo and not self.a.falha and not self.a.estacionado:
+@@ -42,7 +48,11 @@
+             elif self.a.falha or self.a.estacionado:
+                 self.enviar(cmd)
+ 
+-        def experimental(self, m):
++        def experimental(self, m, info):
++            if not fonte_exclusiva(self.get_publishers_info_by_topic('/cmd_vel_nav_t'), info.publisher_gid):
++                self.a.ativo, self.a.falha, self.a.estacionado = False, True, True
++                self.enviar(ZERO)
++                return
+             if self.a.ativo:
+                 self.enviar(self.a.experimental(time.monotonic(), self.cmd(m)))
+ 
+@@ -62,13 +72,25 @@
+             res.message = 'reset manual' if res.success else 'cancele as outras fontes primeiro'
+             return res
+ 
++        def parar(self, req, res):
++            self.a.ativo, self.a.falha, self.a.estacionado = False, True, True
++            self.enviar(ZERO)
++            res.success, res.message = True, 'parada travada; retomada exige reset'
++            return res
++
+         def tick(self):
+             self.a.vigiar(time.monotonic())
+-            if self.a.falha or self.a.estacionado:
++            if (self.a.falha or self.a.estacionado or
++                    (self.heartbeat_parado and not self.a.ativo and
++                     time.monotonic()-self.ultimo_input_normal > 0.25)):
+                 self.enviar(ZERO)
+             m = Bool()
+             m.data = self.a.falha
+             self.falha.publish(m)
++            estado = String()
++            estado.data = json.dumps(dict(ativo=self.a.ativo, falha=self.a.falha,
++                estacionado=self.a.estacionado, stamp_ns=self.get_clock().now().nanoseconds))
++            self.pub_estado.publish(estado)
+ 
+     rclpy.init()
+     n = Arbitro()
+--- a/src/robo_navigation/test/test_giro_frontal.py
++++ b/src/robo_navigation/test/test_giro_frontal.py
+@@ -263,6 +263,7 @@
+             return NS(header=NS(stamp=None, frame_id=''),
+                       twist=NS(linear=NS(x=0, y=0), angular=NS(z=0)))
+         ns = dict(Node=object, time=time, math=math, TempoSensor=TempoSensor,
++                  json=__import__('json'),
+                   TwistStamped=twist,
+                   yaw_de=lambda q: 2*math.atan2(q.z, q.w))
+         exec(compile(module, str(SCRIPTS/'alinhador_passagem.py'), 'exec'), ns)
+@@ -270,7 +271,7 @@
+         self.node = ns['Alinhador'].__new__(ns['Alinhador'])
+         self.node.lock = threading.Lock()
+         self.node.tempos_t, self.node.ultimos_stamps_t = {}, {}
+-        self.node.p = lambda name: 0.0
++        self.node.p = lambda name: 0.2 if name in ('limite_vel_angular_real_t','limite_vel_linear_real_t') else 0.0
+         self.node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=10_000_000_000,
+                                                          to_msg=lambda: 'stamp'))
+ 
+@@ -279,20 +280,20 @@
+         msg = ns(header=ns(stamp=ns(sec=10, nanosec=0)),
+                  orientation=ns(x=0, y=0, z=0, w=1),
+                  angular_velocity=ns(z=0), orientation_covariance=[0]*9)
+-        self.node.ao_imu(msg)
++        self.node.ao_imu(msg, experimental=True)
+         self.assertIsNotNone(self.node.imu_t)
+         msg.orientation_covariance[0] = -1
+-        self.node.ao_imu(msg)
++        self.node.ao_imu(msg, experimental=True)
+         self.assertIsNone(self.node.imu_t)
+         msg.orientation_covariance[0] = 0
+         msg.header.stamp.sec = 9
+-        self.node.ao_imu(msg)
++        self.node.ao_imu(msg, experimental=True)
+         self.assertIsNone(self.node.imu_t)
+ 
+     def test_scan_com_timestamp_antigo_invalida_area(self):
+         self.node.scan_t_raw = 'anterior'
+         msg = self.NS(header=self.NS(stamp=self.NS(sec=9, nanosec=0)))
+-        self.node.ao_scan(msg)
++        self.node.ao_scan(msg, experimental=True)
+         self.assertIsNone(self.node.scan_t_raw)
+ 
+     def test_rota_exclusiva_de_comandos(self):
+@@ -310,24 +311,37 @@
+     def test_topologia_com_publicador_extra_e_recusada(self):
+         self.node.get_name = lambda: 'alinhador_passagem'
+         pubs = {'/cmd_vel_nav_seguro': [self.NS(node_name='arbitro_t')],
+-                '/cmd_vel_nav_t': [self.NS(node_name='alinhador_passagem')]}
++                '/cmd_vel_nav_t': [self.NS(node_name='alinhador_passagem')],
++                '/cmd_vel_smoothed': [self.NS(node_name='velocity_smoother')],
++                '/cmd_vel': [self.NS(node_name='collision_monitor')]}
+         self.node.get_publishers_info_by_topic = pubs.get
+         self.assertTrue(self.node._arbitro_exclusivo())
+         pubs['/cmd_vel_nav_seguro'].append(self.NS(node_name='intruso'))
+         self.assertFalse(self.node._arbitro_exclusivo())
++
++    def test_falha_temporal_explicitamente_invalida_amostra(self):
++        self.node.scan_t_raw, self.node.imu_t = 'scan anterior', 'imu anterior'
++        self.node.tempos_t = dict(lidar='anterior', imu='anterior')
++        self.node.ao_timing_t(self.NS(data='{"sensor":"lidar","timed_frame":true,"valid":false}'))
++        self.assertIsNone(self.node.scan_t_raw)
++        self.assertIsNone(self.node.tempos_t['lidar'])
++        self.node.ao_timing_t(self.NS(data='{"sensor":"imu","timed_frame":false,"valid":false}'))
++        self.assertEqual(self.node.imu_t,'imu anterior')  # legado nao sobrescreve fluxo temporal
++        self.node.ao_timing_t(self.NS(data='{"sensor":"imu","timed_frame":true,"valid":false}'))
++        self.assertIsNone(self.node.imu_t)
+ 
+     def test_callback_imu_nao_renova_029_para_058(self):
+         self.node.get_clock = lambda: self.NS(now=lambda: self.NS(nanoseconds=10_290_000_000))
+         msg = self.NS(header=self.NS(stamp=self.NS(sec=10, nanosec=0)),
+                       orientation=self.NS(x=0, y=0, z=0, w=1),
+                       angular_velocity=self.NS(z=0), orientation_covariance=[0]*9)
+-        self.node.ao_imu(msg)
++        self.node.ao_imu(msg, experimental=True)
+         sample = self.node.tempos_t['imu']
+         self.assertIsNotNone(sample)
+         self.assertAlmostEqual(sample.mono_rx-self.node.imu_t[0], 0.29)
+         self.assertFalse(sample.recente(10_580_000_000, sample.mono_rx+0.29))
+ 
+-    def test_scan_desconta_duracao_sem_reescrever_header(self):
++    def test_scan_temporal_nao_desconta_duas_vezes_sem_reescrever_header(self):
+         self.node.laser_tf = (0, 0, 0)
+         self.node.odom, self.node.scan_seq = None, 0
+         self.node.get_clock = lambda: self.NS(now=lambda: self.NS(nanoseconds=10_050_000_000))
+@@ -336,23 +350,26 @@
+                       angle_min=-math.pi, angle_increment=math.pi/90,
+                       range_min=0.05, range_max=10, ranges=[2.0]*180)
+         self.node.p = lambda name: 0.02
+-        self.node.ao_scan(msg)
++        self.node.ao_scan(msg, experimental=True)
+         sample = self.node.tempos_t['lidar']
+-        self.assertAlmostEqual(sample.mono_rx-self.node.scan_t_raw[0], 0.24)
++        self.assertAlmostEqual(sample.mono_rx-self.node.scan_t_raw[0], 0.05)
+         self.assertEqual(msg.header.stamp.sec, 10)
+         self.assertEqual(msg.header.stamp.nanosec, 0)
+         self.assertEqual(sample.stamp_ns, 10_000_000_000)
+-        self.node.p = lambda name: -1.0
+-        self.node.ao_scan(msg)
+-        self.assertIsNone(self.node.scan_t_raw)
+-
+-    def test_precondicao_recusa_driver_180_bins_antes_do_preparo(self):
++        # Janela deslizante pode manter o raio mais antigo: conserva MESMO prazo.
++        self.node.ao_scan(msg, experimental=True)
++        self.assertEqual(self.node.tempos_t['lidar'],sample)
++        self.assertEqual(self.node.scan_t_raw[0],sample.aquisicao_mono)
++
++    def test_precondicao_aceita_180_bins_com_lacuna_limitada_e_exige_tempo(self):
+         import time
+         stamp = self.NS(sec=10, nanosec=0)
+         sample = TempoSensor.receber(stamp, 10_000_000_000, time.monotonic())
+         self.node.tempos_t = dict(lidar=sample, imu=sample, odom=sample)
+         self.node.scan_t_raw = (sample.aquisicao_mono, [2]*180, -math.pi,
+                                 math.pi/90, 0.05, 10, (0, 0, 0))
++        self.assertTrue(self.node._precondicoes_t())
++        self.node.scan_t_raw[1][10] = math.inf
+         self.assertFalse(self.node._precondicoes_t())
+         self.node.scan_t_raw = (sample.aquisicao_mono, [2]*720, -math.pi,
+                                 math.pi/360, 0.05, 10, (0, 0, 0))
+@@ -394,6 +411,8 @@
+                                    relogio=lambda: clock[0], esperar=esperar, timeout=0.1))
+                 self.node.controle_t = self.NS(wait_for_service=lambda **kw: True, call_async=enviar)
+                 self.node._arbitro_exclusivo = lambda: True
++                self.node._verificar_cm_t = lambda: True
++                self.node._estado_t = lambda *args: None
+                 self.node.handle_ativo = None
+                 self.node._parar, self.node._publicar_vel = parar, mandar
+                 self.node.get_logger = lambda: self.NS(info=lambda _: None)
+@@ -467,8 +486,8 @@
+             r[100] = valor
+             self.assertEqual(self.avaliar(r), Observacao.DESCONHECIDA)
+ 
+-    def test_uma_amostra_por_setor_nao_certifica_setor(self):
+-        self.assertEqual(self.avaliar([2.0]*180, math.pi/90), Observacao.DESCONHECIDA)
++    def test_180_bins_lacuna_limitada_sem_preencher_raios_invalidos(self):
++        self.assertEqual(self.avaliar([2.0]*180, math.pi/90), Observacao.LIVRE)
+         r = [float('nan')]*720
+         r[::4] = [2.0]*180
+         self.assertEqual(self.avaliar(r), Observacao.DESCONHECIDA)
+diff --git a/src/robo_navigation/test/test_integrado_t.py b/src/robo_navigation/test/test_integrado_t.py
+new file mode 100644
+index 0000000..2c0cc47
+--- /dev/null
++++ b/src/robo_navigation/test/test_integrado_t.py
+@@ -0,0 +1,307 @@
++"""Integracao simulada em memoria. Nao inicia ROS nem publica velocidade."""
++import ast
++import importlib.util
++import json
++import math
++from pathlib import Path
++import sys
++import tarfile
++import tempfile
++import unittest
++from unittest.mock import patch
++import yaml
++
++ROOT=Path(__file__).resolve().parents[3]
++sys.path.insert(0,str(ROOT/'src/robo_navigation/scripts'))
++from giro_frontal import GiroFrontal, ArbitragemT, ZERO, Observacao, avaliar_varredura
++
++
++def module(name,file):
++    spec=importlib.util.spec_from_file_location(name,file)
++    result=importlib.util.module_from_spec(spec)
++    sys.modules[name]=result
++    spec.loader.exec_module(result)
++    return result
++
++
++class TestLacunas(unittest.TestCase):
++    def test_180_bins_com_sensor_deslocado(self):
++        self.assertEqual(avaliar_varredura([2]*180,-math.pi,math.pi/90,0.08,6,
++                         (0.330,0.005,0),math.hypot(.365,.315)+.05), Observacao.LIVRE)
++
++    def test_lacuna_fisica_grande_e_desconhecida(self):
++        self.assertEqual(avaliar_varredura([2]*36,-math.pi,math.pi/18,0.08,6,
++                         (.33,.005,0),.532),Observacao.DESCONHECIDA)
++
++    def test_mascaras_reais_impedem_giro(self):
++        cfg=yaml.safe_load((ROOT/'src/robo_lidar/config/lidar.yaml').read_text())
++        intervals=cfg['scan_filter']['ros__parameters']['blocked_intervals_deg']
++        r=[2.0]*180
++        for part in intervals.split(','):
++            lo,hi=map(float,part.split(':'))
++            for i in range(180):
++                if lo <= -180+2*i <= hi:
++                    r[i]=math.inf
++        self.assertEqual(avaliar_varredura(r,-math.pi,math.pi/90,.08,6,(.33,.005,0),.532),
++                         Observacao.DESCONHECIDA)
++
++    def test_movimento_durante_varredura_exige_cobertura_adicional(self):
++        self.assertEqual(avaliar_varredura([2.0]*180,-math.pi,math.pi/90,.08,6,(.33,.005,0),.532,
++            movimento_angular=.2),Observacao.DESCONHECIDA)
++        r=[2.0]*180; r[90]=.59
++        self.assertEqual(avaliar_varredura(r,-math.pi,math.pi/90,.08,6,(0,0,0),.54,
++            movimento_linear=.03),Observacao.OBSTACULO)
++
++    def test_um_bin_sem_retorno_nunca_e_livre(self):
++        for value in (math.inf,math.nan):
++            r=[2.0]*180
++            r[80]=value
++            self.assertEqual(avaliar_varredura(r,-math.pi,math.pi/90,.08,6,(.33,.005,0),.532),
++                             Observacao.DESCONHECIDA)
++
++    def test_reserva_de_lacuna_aumenta_folga(self):
++        # O mesmo retorno seria alem de raio+2,5 cm; agora a lacuna tambem e reservada.
++        r=[2.0]*180
++        r[90]=.54+.025+.005
++        self.assertEqual(avaliar_varredura(r,-math.pi,math.pi/90,.08,6,(0,0,0),.54),
++                         Observacao.OBSTACULO)
++
++
++class TestIntegracaoSimulada(unittest.TestCase):
++    def simular(self,lado,interromper=None):
++        g=GiroFrontal((0,0),(0,lado),(0,lado*.2),margem=.2,timeout=40)
++        a=ArbitragemT()
++        self.assertTrue(a.adquirir(0))
++        x=y=yaw=0.0
++        velocity=0.0
++        ultimo=ZERO
++        for i in range(1000):
++            t=i*.05
++            if interromper and t>2:
++                kind=interromper
++            else:
++                kind=None
++            if kind=='conflito':
++                self.assertEqual(a.normal(t,(.1,0,0)),ZERO)
++            livre=avaliar_varredura([2.0]*180,-math.pi,math.pi/90,.08,6,(.33,.005,0),.532) is Observacao.LIVRE
++            imu=(t,yaw,velocity) if kind!='imu' else None
++            cmd=g.passo(t,(x,y,yaw),imu,t if kind!='lidar' else t-1,livre and kind!='obstaculo',
++                         abs(velocity)<.03 and ultimo==ZERO,
++                         cancelado=kind=='cancelamento',bloqueado=a.falha)
++            actual=a.experimental(t,cmd)
++            a.vigiar(t)
++            # Modelo deliberadamente explicito, nao afirmado como calibracao real.
++            wanted=math.copysign(max(.157,abs(actual[2])),actual[2]) if actual[2] else 0
++            velocity += max(-.8*.05,min(.8*.05,wanted-velocity))
++            yaw += velocity*.05
++            x += actual[0]*math.cos(yaw)*.05
++            y += actual[0]*math.sin(yaw)*.05
++            ultimo=actual
++            if g.estado in ('fim','abortar'):
++                self.assertEqual(cmd,ZERO)
++                return g,a,t
++        self.fail('simulacao nao terminou')
++
++    def test_curva_esquerda_com_atuador_minimo_simulado(self):
++        self.assertEqual(self.simular(1)[0].estado,'fim')
++
++    def test_curva_direita_com_atuador_minimo_simulado(self):
++        self.assertEqual(self.simular(-1)[0].estado,'fim')
++
++    def test_interrupcoes_em_toda_cadeia(self):
++        for reason in ('imu','lidar','obstaculo','cancelamento','conflito'):
++            with self.subTest(reason=reason):
++                g,a,t=self.simular(1,reason)
++                self.assertEqual(g.estado,'abortar')
++                a.vigiar(t+.3)
++                self.assertFalse(a.ativo)
++                self.assertEqual(a.normal(t+.4,(.1,0,0)),ZERO)
++
++    def test_fonte_dds_exclusiva_e_comando_nao_finito(self):
++        from types import SimpleNamespace as NS
++        from giro_frontal import fonte_exclusiva
++        endpoint=NS(node_name='alinhador_passagem',endpoint_gid=[1,2,3])
++        self.assertTrue(fonte_exclusiva([endpoint],[1,2,3]))
++        self.assertFalse(fonte_exclusiva([endpoint,endpoint],[1,2,3]))
++        self.assertFalse(fonte_exclusiva([endpoint],[9,9,9]))
++        self.assertFalse(fonte_exclusiva([],[]))
++        for source in ('normal','experimental'):
++            a=ArbitragemT(); a.adquirir(0)
++            self.assertEqual(getattr(a,source)(.1,(math.nan,0,0)),ZERO)
++            self.assertTrue(a.falha)
++            self.assertFalse(a.ativo)
++
++    def test_lease_cobre_centro_e_giro_sem_adquirir_duas_vezes(self):
++        a=ArbitragemT()
++        self.assertTrue(a.adquirir(0))
++        self.assertEqual(a.experimental(.1,(.03,0,0)),(.03,0,0))
++        self.assertFalse(a.adquirir(.2))
++        self.assertEqual(a.experimental(.2,(0,0,.025)),(0,0,.025))
++        self.assertEqual(a.normal(.3,(.1,0,0)),ZERO)
++        self.assertTrue(a.falha)
++
++
++class TestCollisionMonitor(unittest.TestCase):
++    def setUp(self):
++        self.cm=yaml.safe_load((ROOT/'src/robo_navigation/config/nav2_params.yaml').read_text())['collision_monitor']['ros__parameters']
++
++    def test_default_desabilitado_e_protecoes_anteriores_preservadas(self):
++        self.assertFalse(self.cm['SweptTurnStop']['enabled'])
++        self.assertIn('VelocityPolygonStop',self.cm['polygons'])
++        self.assertEqual(self.cm['cmd_vel_in_topic'],'cmd_vel_smoothed')
++        self.assertEqual(self.cm['cmd_vel_out_topic'],'cmd_vel')
++        self.assertEqual(self.cm['SweptTurnStop']['min_points'],1)
++
++    def test_todos_os_cantos_varridos_dentro_do_envelope(self):
++        p=ast.literal_eval(self.cm['SweptTurnStop']['left_turn']['points'])
++        def dentro(x,y):
++            return all((p[(i+1)%len(p)][0]-a[0])*(y-a[1])-
++                       (p[(i+1)%len(p)][1]-a[1])*(x-a[0])>=-1e-6 for i,a in enumerate(p))
++        for j in range(361):
++            yaw=math.radians(j)
++            for x,y in ((.365,.315),(.365,-.315),(-.205,.315),(-.205,-.315)):
++                self.assertTrue(dentro(x*math.cos(yaw)-y*math.sin(yaw), x*math.sin(yaw)+y*math.cos(yaw)))
++
++    def test_validador_de_parametro_ativo_recusa_poligono_reduzido(self):
++        from giro_frontal import envolve_disco
++        radius=math.hypot(.365,.315)+.05
++        pts=ast.literal_eval(self.cm['SweptTurnStop']['left_turn']['points'])
++        self.assertTrue(envolve_disco(pts,radius))
++        self.assertFalse(envolve_disco([[x*.9,y*.9] for x,y in pts],radius))
++        self.assertFalse(envolve_disco(list(reversed(pts)),radius))
++
++    def test_cobertura_rotacao_pura_e_combinada(self):
++        cm=self.cm['SweptTurnStop']
++        for vx,vy in ((0,0),(.03,0),(.2,.16),(-.16,-.16)):
++            for wz,name in ((.025,'left_turn'),(.4,'left_turn'),(-.025,'right_turn'),(-.4,'right_turn')):
++                p=cm[name]
++                self.assertTrue(p['linear_min']<=math.hypot(vx,vy)<=p['linear_max'])
++                self.assertTrue(p['theta_min']<=wz<=p['theta_max'])
++
++
++class TestGravador(unittest.TestCase):
++    def test_empacotamento_preserva_brutos_e_snapshot(self):
++        recorder=module('gravador_integrado_test',ROOT/'ferramentas/gravar_teste.py')
++        with tempfile.TemporaryDirectory() as tmp:
++            # Snapshot minimo neste teste; preservacao real de fontes e testada separadamente.
++            def sources(folder):
++                (folder/'fontes').mkdir()
++                (folder/'fontes/status.txt').write_text('simulado')
++            with patch.object(recorder,'snapshot_sources',sources):
++                self.assertEqual(recorder.main(['teste','simulado','--offline-test','--base',tmp]),0)
++            folders=[p for p in Path(tmp).iterdir() if p.is_dir()]
++            self.assertEqual(len(folders),1)
++            folder=folders[0]
++            self.assertTrue((folder/'bag_simulado/NAO_E_UM_ROSBAG.txt').exists())
++            self.assertTrue(json.loads((folder/'manifesto.json').read_text())['simulado'])
++            with tarfile.open(folder.with_suffix('.tar.gz')) as tar:
++                self.assertIn(folder.name+'/fontes/status.txt',tar.getnames())
++
++    def test_encerramento_e_sigint_preservam_bag_com_processos_simulados(self):
++        import os, signal
++        recorder=module('gravador_ciclo_test',ROOT/'ferramentas/gravar_teste.py')
++        for interrupt in (False, True):
++            with self.subTest(interrupt=interrupt), tempfile.TemporaryDirectory() as tmp:
++                class Processo:
++                    returncode=None
++                    def poll(self): return self.returncode
++                    def send_signal(self,sig): self.returncode=0
++                    def wait(self,timeout=None):
++                        if self.returncode is None: self.returncode=0
++                        return self.returncode
++                def popen(cmd,**kwargs):
++                    if cmd[0]=='ros2':
++                        folder=Path(cmd[cmd.index('-o')+1]);folder.mkdir()
++                        (folder/'dados.mcap').write_bytes(b'DADOS SIMULADOS PRESERVADOS')
++                        (folder/'metadata.yaml').write_text(yaml.safe_dump(dict(
++                            rosbag2_bagfile_information=dict(topics_with_message_count=[dict(
++                                topic_metadata=dict(name='/scan_nav'),message_count=1)]))))
++                    return Processo()
++                def sources(folder): (folder/'fontes').mkdir()
++                def ros(folder,phase,offline):
++                    (folder/phase).mkdir()
++                    if interrupt and phase=='inicio': os.kill(os.getpid(),signal.SIGINT)
++                def capture(args,target,**kwargs): target.write_text('simulado');return 0
++                with patch.object(recorder,'snapshot_sources',sources), patch.object(recorder,'snapshot_ros',ros), \
++                     patch.object(recorder,'capture',capture), patch.object(recorder.subprocess,'Popen',popen):
++                    self.assertEqual(recorder.main(['simulado','processos falsos','--base',tmp,'--duration','.01']),0)
++                folder=next(p for p in Path(tmp).iterdir() if p.is_dir())
++                self.assertEqual((folder/'bag/dados.mcap').read_bytes(),b'DADOS SIMULADOS PRESERVADOS')
++                manifest=json.loads((folder/'manifesto.json').read_text())
++                self.assertEqual(manifest['retorno_bag'],0)
++                self.assertEqual(manifest['mensagens_por_topico']['/scan_nav'],1)
++                self.assertTrue(folder.with_suffix('.tar.gz').exists())
++
++    def test_snapshot_inclui_codigo_nao_commitado(self):
++        recorder=module('gravador_snapshot_test',ROOT/'ferramentas/gravar_teste.py')
++        with tempfile.TemporaryDirectory() as tmp:
++            recorder.snapshot_sources(Path(tmp))
++            with tarfile.open(Path(tmp)/'fontes/workspace_fontes.tar.gz') as tar:
++                self.assertIn('src/robo_navigation/scripts/giro_frontal.py',tar.getnames())
++                self.assertIn('firmware/mega_mecanum_temporal/mega_mecanum_temporal.ino',tar.getnames())
++            self.assertTrue((Path(tmp)/'fontes/diff.txt').stat().st_size>0)
++
++    def test_grava_todos_topicos_e_inclui_estagios(self):
++        recorder=module('gravador_topicos_test',ROOT/'ferramentas/gravar_teste.py')
++        for topic in ('/scan_nav','/scan_raw_temporal','/cmd_vel_ctrl','/cmd_vel_nav_seguro',
++                      '/arbitro_t/estado','/alinhador/estado_t','/global_costmap/costmap_updates'):
++            self.assertIn(topic,recorder.IMPORTANT)
++        source=(ROOT/'ferramentas/gravar_teste.py').read_text()
++        self.assertIn("'--all','--include-hidden-topics'",source)
++
++
++class TestPreflight(unittest.TestCase):
++    def test_incompleto_nao_apto(self):
++        preflight=module('preflight_test',ROOT/'ferramentas/verificar_giro_t.py')
++        self.assertEqual(preflight.evaluate({})['parecer'],'NAO APTO')
++
++    def test_snapshot_simulado_completo_e_mascara(self):
++        preflight=module('preflight_full_test',ROOT/'ferramentas/verificar_giro_t.py')
++        keys=('modo_experimental','cm_envelope','cm_ativo','smoother_ativo',
++              'hardware_timing_valido','limites_temporais_configurados','tf_laser_valida',
++              'arbitro_disponivel','saida_zero','arbitro_parado','sem_correcao_pos_cm','limites_de_movimento_configurados','autoridade_no_hardware')
++        data=dict(checks=dict.fromkeys(keys,True), ages=dict(scan=.1,imu=.1,odom=.1),gyro_abs=0,linear_abs=0,
++                  scan=dict(ranges=[2.0]*180,amin=-math.pi,inc=math.pi/90,rmin=.08,rmax=6),
++                  publishers={'/cmd_vel_nav_seguro':['arbitro_t'],'/cmd_vel_nav_t':['alinhador_passagem'],
++                              '/cmd_vel_smoothed':['velocity_smoother'],'/cmd_vel':['collision_monitor']})
++        self.assertEqual(preflight.evaluate(data)['parecer'],'APTO')
++        data['scan']['ranges'][100]=math.inf
++        self.assertEqual(preflight.evaluate(data)['parecer'],'NAO APTO')
++        data['scan']['ranges'][100]=2.0
++        data['ages']['scan']=.58
++        self.assertEqual(preflight.evaluate(data)['parecer'],'NAO APTO')
++        data['ages']['scan']=.1
++        data['publishers']['/cmd_vel'].append('teleop')
++        self.assertEqual(preflight.evaluate(data)['parecer'],'NAO APTO')
++
++
++class TestReversao(unittest.TestCase):
++    def test_restaura_sem_perder_arquivos_e_recusa_alteracao_posterior(self):
++        import hashlib
++        restore=module('restaurador_test',ROOT/'ferramentas/restaurar_arquivos_integrado.py')
++        with tempfile.TemporaryDirectory() as tmp:
++            root=Path(tmp);(root/'src').mkdir()
++            changed=root/'src/antigo.py';changed.write_text('depois')
++            new=root/'src/novo.py';new.write_text('novo')
++            wrapper=root/'wrapper.sh';wrapper.write_text('depois')
++            original=root/'wrapper_antes.sh';original.write_text('antes')
++            original_file=root/'original.tmp';original_file.write_text('antes')
++            snapshot=root/'snapshot.tar.gz'
++            with tarfile.open(snapshot,'w:gz') as tar:tar.add(original_file,arcname='src/antigo.py')
++            def entry(p):return dict(path=str(p.relative_to(root)),sha256=restore.digest(p))
++            manifest=dict(modificados_existentes=[entry(changed)],novos_codigo=[entry(new)],
++                          wrapper_home_sha256=restore.digest(wrapper))
++            changed.write_text('outra sessao')
++            with self.assertRaises(RuntimeError):restore.restore(root,manifest,snapshot,wrapper,original)
++            self.assertEqual(changed.read_text(),'outra sessao')
++            changed.write_text('depois')
++            backup=restore.restore(root,manifest,snapshot,wrapper,original)
++            self.assertEqual(changed.read_text(),'antes')
++            self.assertEqual(wrapper.read_text(),'antes')
++            self.assertFalse(new.exists())
++            self.assertEqual((backup/'novos/src/novo.py').read_text(),'novo')
++            with self.assertRaises(ValueError):restore.safe_path(root,'../../etc/passwd')
++
++
++if __name__=='__main__':
++    unittest.main()

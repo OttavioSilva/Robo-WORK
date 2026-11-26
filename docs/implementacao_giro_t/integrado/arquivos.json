@@ -1,0 +1,138 @@
+{
+  "modificados_existentes": [
+    {
+      "path": "ferramentas/gravar_teste.sh",
+      "sha256": "b0e2da0531b4d0d28bee7b96be9f1db15a05885f972df0121b106db2783a4481",
+      "mode": 509
+    },
+    {
+      "path": "src/robo_hardware/CMakeLists.txt",
+      "sha256": "4e7298148c266050b51b10229adf05ebf7d646cd2889cea1820786b41dab7d8b",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_hardware/launch/hardware.launch.py",
+      "sha256": "3c00a2f5f0317c98c23721b17bd1f31c097740ffbaca24926a97301981e292d2",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_hardware/src/hardware_bridge_node.cpp",
+      "sha256": "f3b79495a3d1e808cf86022666568a96ff7bae24b2d3377ba3cc5634f32893c2",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_lidar/launch/lidar_filter.launch.py",
+      "sha256": "dcbac8131ff3b54c3717649af658241d4ee26b60c990018777612fb9bfea444a",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_lidar/package.xml",
+      "sha256": "5e37782bcd8ffd37973a91b4bbe6b441a3aa0030fa34004dc4f0f26c88396c35",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_navigation/CMakeLists.txt",
+      "sha256": "955da74dbdb01388f6132502d536240e474994bffdf29a369f19cc894d80b195",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_navigation/package.xml",
+      "sha256": "921827c231f64b2c545b31f1b2f7d91b4d7966bcb9de39e43beb7a585e2287b1",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_navigation/config/nav2_params.yaml",
+      "sha256": "36a3bef2df93d676b7a6d05bff72552874b0e7155ca7dee8799768dfa477932f",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_navigation/launch/navigation.launch.py",
+      "sha256": "d7f1c7873c52782bcc2cec2dd534cb70fc64d9925e6f08238f4611cd8437384d",
+      "mode": 420
+    },
+    {
+      "path": "src/robo_navigation/scripts/alinhador_passagem.py",
+      "sha256": "6120e00cac7ad9211e9cd7dde44e0af39410a2eef9492ef5a87434d6c43df48e",
+      "mode": 436
+    },
+    {
+      "path": "src/robo_navigation/scripts/giro_frontal.py",
+      "sha256": "d52f0d0ddbed4b61d2edf99678816f4fdccc5567e70036198ffac40a326768db",
+      "mode": 436
+    },
+    {
+      "path": "src/robo_navigation/scripts/arbitro_t.py",
+      "sha256": "159a13b26b0c353e669b50f6eda79464b2ed809cced863e373d4f82b78565edc",
+      "mode": 436
+    },
+    {
+      "path": "src/robo_navigation/test/test_giro_frontal.py",
+      "sha256": "b20c4b44c18873e11b2ccadac550f0ee503adeb34a2a23c39db4b568005a6899",
+      "mode": 436
+    }
+  ],
+  "novos_codigo": [
+    {
+      "path": "ferramentas/gravar_teste.py",
+      "sha256": "f2c9c6e7e4bb9999035f0ab89d6edf9add5c4bdb1c5afe77f1f0d1ba54b64d31",
+      "mode": 509
+    },
+    {
+      "path": "ferramentas/gravacao_qos.yaml",
+      "sha256": "9387f848d5ec1a00a13f607e5187f72b2cbea6fe6feb5c8db26cfcdc546a0bc5",
+      "mode": 436
+    },
+    {
+      "path": "ferramentas/trajetoria_teste.py",
+      "sha256": "5ae85d458d45318145f1b0768530c1b8b68775b9c52e15df9264a88ffa573576",
+      "mode": 436
+    },
+    {
+      "path": "ferramentas/verificar_giro_t.py",
+      "sha256": "5bc8115a208458b5df75e28f3f9a52ec500f77835d5dfad16d212361e2751a74",
+      "mode": 509
+    },
+    {
+      "path": "ferramentas/iniciar_teste_giro_t.sh",
+      "sha256": "b64beed8ab925bd285e5240d0924e0d5b1de0c640d8936d4921f2a2a15b2b50c",
+      "mode": 509
+    },
+    {
+      "path": "ferramentas/compilar_firmware_temporal.py",
+      "sha256": "a143bcb4a28ce65bd19c3e4559d6f461f384fe355e8efe48a5b08117445f6e57",
+      "mode": 509
+    },
+    {
+      "path": "ferramentas/restaurar_arquivos_integrado.py",
+      "sha256": "af0ac12877a0d3610b3adbd064cfe56b94ec50dff99cda192e36ea6f2943f6f4",
+      "mode": 436
+    },
+    {
+      "path": "firmware/mega_mecanum_temporal/mega_mecanum_temporal.ino",
+      "sha256": "92cc20204cb1db7669f8984daabea8b71cb7a1e4b676b984c190e99834f79e12",
+      "mode": 436
+    },
+    {
+      "path": "firmware/mega_mecanum_temporal/sliding_scan.h",
+      "sha256": "46544567646a7467010b3ae0532308dcd926ecbcedc52f360bc2e9942f842cf6",
+      "mode": 436
+    },
+    {
+      "path": "src/robo_hardware/include/robo_hardware/sensor_clock.hpp",
+      "sha256": "33a654c305f5af8c96e68674c635f99643b2a8c05a75a18862bb99ef0c8d44de",
+      "mode": 436
+    },
+    {
+      "path": "src/robo_hardware/test/test_sensor_clock.cpp",
+      "sha256": "de9489922dcb4df84d9262f27b13fd97ea59d40e59517d2040805a7fbd0341d3",
+      "mode": 436
+    },
+    {
+      "path": "src/robo_navigation/test/test_integrado_t.py",
+      "sha256": "a1d6ca6d1cab470dc0a4b78ae0854013f42901df4b9871ce91050fa5db18a558",
+      "mode": 436
+    }
+  ],
+  "wrapper_home_sha256": "b0e2da0531b4d0d28bee7b96be9f1db15a05885f972df0121b106db2783a4481",
+  "git_head": "72013674bd5b00a5e1509b4c4fb7592362c2d1da"
+}

@@ -7,6 +7,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <sstream>
+#include "robo_hardware/sensor_clock.hpp"
 #include <poll.h>
 #include <stdexcept>
 #include <string>
@@ -25,6 +27,8 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float64.hpp"
+#include "std_msgs/msg/string.hpp"
+#include "std_msgs/msg/u_int8_multi_array.hpp"
 
 namespace
 {
@@ -152,6 +156,16 @@ public:
     minimum_pwm_ = declare_parameter<int>("minimum_pwm", 150);
     minimum_rotation_pwm_ = declare_parameter<int>("minimum_rotation_pwm", 100);
     maximum_pwm_ = declare_parameter<int>("maximum_pwm", 215);
+    // GANHO_LATERAL (12/11): ganho de PWM por roda so no movimento lateral (1.0 = como antes)
+    lateral_wheel_gain_[0] = declare_parameter<double>("lateral_wheel_gain_fl", 1.0);
+    lateral_wheel_gain_[1] = declare_parameter<double>("lateral_wheel_gain_fr", 1.0);
+    lateral_wheel_gain_[2] = declare_parameter<double>("lateral_wheel_gain_rl", 1.0);
+    lateral_wheel_gain_[3] = declare_parameter<double>("lateral_wheel_gain_rr", 1.0);
+    for (const double g : lateral_wheel_gain_) {
+      if (!(g >= 0.5 && g <= 1.6)) {
+        throw std::invalid_argument("lateral_wheel_gain_* must be between 0.5 and 1.6");
+      }
+    }
     command_rate_hz_ = declare_parameter<double>("command_rate_hz", 20.0);
     command_timeout_s_ = declare_parameter<double>("command_timeout_s", 0.25);
     scan_frame_ = declare_parameter<std::string>("scan_frame", "laser_raw");
@@ -184,6 +198,24 @@ public:
     heading_hold_imu_timeout_s_ = declare_parameter<double>(
       "heading_hold_imu_timeout_s", 0.20);
 
+    command_authority_ = declare_parameter<std::string>("command_authority", "");
+    temporal_enabled_ = declare_parameter<bool>("temporal_enabled", false);
+    clock_drift_ppm_ = declare_parameter<double>("device_clock_drift_bound_ppm", -1.0);
+    lidar_capture_lag_ = declare_parameter<double>("lidar_capture_lag_bound_s", -1.0);
+    imu_capture_lag_ = declare_parameter<double>("imu_capture_lag_bound_s", -1.0);
+    if (!std::isfinite(clock_drift_ppm_) || !std::isfinite(lidar_capture_lag_) || !std::isfinite(imu_capture_lag_)) {
+      throw std::invalid_argument("temporal bounds must be finite; -1 means unknown");
+    }
+    scan_temporal_publisher_ = create_publisher<sensor_msgs::msg::LaserScan>(
+      "scan_raw_temporal", rclcpp::SensorDataQoS());
+    imu_temporal_publisher_ = create_publisher<sensor_msgs::msg::Imu>(
+      "imu/data_temporal", rclcpp::SensorDataQoS());
+    timing_publisher_ = create_publisher<std_msgs::msg::String>("hardware/sensor_timing", 20);
+    tx_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/tx_frames", 20);
+    rx_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/serial_rx", 20);
+    lidar_packet_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/lidar_packets", 100);
+    effective_publisher_ = create_publisher<geometry_msgs::msg::TwistStamped>("cmd_vel_hardware", 20);
+    probe_timer_ = create_wall_timer(200ms, [this]() { send_clock_probe(); });
     validate_parameters();
 
     parameter_callback_handle_ = add_on_set_parameters_callback(
@@ -191,8 +223,10 @@ public:
         return update_heading_hold_parameters(parameters);
       });
 
+    // LIDAR_M2M2 (24/11): com o M2M2 a ponte m2m2_bridge publica scan_raw;
+    // o scan do Delta-2D (via Mega) vai para outro topico (scan_topic:=scan_raw_delta).
     scan_publisher_ = create_publisher<sensor_msgs::msg::LaserScan>(
-      "scan_raw", rclcpp::SensorDataQoS().keep_last(5));
+      declare_parameter<std::string>("scan_topic", "scan_raw"), rclcpp::SensorDataQoS().keep_last(5));
     imu_publisher_ = create_publisher<sensor_msgs::msg::Imu>(
       "imu/data", rclcpp::SensorDataQoS().keep_last(20));
     yaw_publisher_ = create_publisher<std_msgs::msg::Float64>(
@@ -202,7 +236,18 @@ public:
 
     command_subscription_ = create_subscription<geometry_msgs::msg::TwistStamped>(
       "cmd_vel", rclcpp::QoS(10).reliable(),
-      [this](const geometry_msgs::msg::TwistStamped::SharedPtr message) {
+      [this](const geometry_msgs::msg::TwistStamped::SharedPtr message, const rclcpp::MessageInfo &info) {
+        if (!command_authority_.empty()) {
+          const auto publishers = get_publishers_info_by_topic("/cmd_vel");
+          const auto &gid = info.get_rmw_message_info().publisher_gid;
+          if (publishers.size() != 1 || publishers[0].node_name() != command_authority_ ||
+              !std::equal(publishers[0].endpoint_gid().begin(), publishers[0].endpoint_gid().end(), gid.data)) {
+            have_velocity_command_ = false;
+            reset_heading_hold();
+            queue_motor_command({0, 0, 0, 0}, 0);
+            return;
+          }
+        }
         receive_command(*message);
       });
 
@@ -343,6 +388,7 @@ private:
     double linear_deadband = heading_hold_linear_deadband_mps_;
     double angular_deadband = heading_hold_angular_deadband_rps_;
     double imu_timeout = heading_hold_imu_timeout_s_;
+    std::array<double, 4> lateral_gains = lateral_wheel_gain_;   // GANHO_LATERAL (12/11)
 
     rcl_interfaces::msg::SetParametersResult result;
     result.successful = false;
@@ -350,6 +396,11 @@ private:
     try {
       for (const auto & parameter : parameters) {
         const std::string & name = parameter.get_name();
+        if (name == "command_authority" || name == "temporal_enabled" || name == "device_clock_drift_bound_ppm" ||
+          name == "lidar_capture_lag_bound_s" || name == "imu_capture_lag_bound_s") {
+          result.reason = "temporal protocol settings require process restart";
+          return result;
+        }
         if (name == "heading_hold_enabled") {
           enabled = parameter.as_bool();
         } else if (name == "heading_hold_kp") {
@@ -374,6 +425,19 @@ private:
           linear_deadband = parameter.as_double();
         } else if (name == "heading_hold_angular_deadband_rps") {
           angular_deadband = parameter.as_double();
+        } else if (name.rfind("lateral_wheel_gain_", 0) == 0) {   // GANHO_LATERAL (12/11)
+          const double g = parameter.as_double();
+          if (!(g >= 0.5 && g <= 1.6)) {
+            result.reason = "lateral_wheel_gain_* must be between 0.5 and 1.6";
+            return result;
+          }
+          const std::size_t i = name == "lateral_wheel_gain_fl" ? 0U : name == "lateral_wheel_gain_fr" ? 1U :
+            name == "lateral_wheel_gain_rl" ? 2U : name == "lateral_wheel_gain_rr" ? 3U : 4U;
+          if (i > 3U) {
+            result.reason = "unknown lateral wheel gain";
+            return result;
+          }
+          lateral_gains[i] = g;
         } else if (name == "heading_hold_imu_timeout_s") {
           imu_timeout = parameter.as_double();
         }
@@ -405,6 +469,7 @@ private:
     heading_hold_linear_deadband_mps_ = linear_deadband;
     heading_hold_angular_deadband_rps_ = angular_deadband;
     heading_hold_imu_timeout_s_ = imu_timeout;
+    lateral_wheel_gain_ = lateral_gains;   // GANHO_LATERAL (12/11)
     reset_heading_hold();
 
     result.successful = true;
@@ -420,10 +485,22 @@ private:
     if (!std::isfinite(linear_x) || !std::isfinite(linear_y) ||
       !std::isfinite(angular_z))
     {
-      RCLCPP_WARN(get_logger(), "Ignoring non-finite velocity command");
+      have_velocity_command_ = false;
+      reset_heading_hold();
+      queue_motor_command({0, 0, 0, 0}, 0);
+      RCLCPP_WARN(get_logger(), "Stopping on non-finite velocity command");
       return;
     }
 
+    const int64_t source_ns = (message.header.stamp.sec >= 0 && message.header.stamp.nanosec < 1000000000U)
+      ? rclcpp::Time(message.header.stamp).nanoseconds() : 0;
+    if (!robo_hardware::valid_command_stamp(source_ns, now().nanoseconds(), command_timeout_s_)) {
+      have_velocity_command_ = false;
+      reset_heading_hold();
+      queue_motor_command({0, 0, 0, 0}, 0);
+      RCLCPP_WARN(get_logger(), "Velocity command source timestamp invalid/stale");
+      return;
+    }
     commanded_vx_mps_ = linear_x;
     commanded_vy_mps_ = linear_y;
     commanded_wz_rps_ = angular_z;
@@ -483,6 +560,8 @@ private:
     serial_command_ready_time_ = steady_clock_.now() +
       rclcpp::Duration::from_seconds(serial_startup_delay_s_);
     reset_rx_parser();
+    sensor_clock_.reset();
+    probe_pending_ = false;
     pending_tx_frame_.clear();
     pending_tx_offset_ = 0;
     RCLCPP_INFO(
@@ -498,6 +577,8 @@ private:
       serial_fd_ = -1;
     }
     reset_rx_parser();
+    sensor_clock_.reset();
+    probe_pending_ = false;
     pending_tx_frame_.clear();
     pending_tx_offset_ = 0;
     have_latest_imu_ = false;
@@ -567,6 +648,9 @@ private:
             get_logger(), "First serial RX after %.3f s (%zd bytes)",
             (steady_clock_.now() - serial_open_time_).seconds(), count);
         }
+        std_msgs::msg::UInt8MultiArray raw;
+        raw.data.assign(read_buffer.begin(), read_buffer.begin()+count);
+        rx_publisher_->publish(raw);
         host_rx_bytes_ += static_cast<uint64_t>(count);
         ++host_rx_reads_;
         for (ssize_t i = 0; i < count; ++i) {
@@ -648,7 +732,20 @@ private:
 
     const uint8_t type = rx_frame_[1];
     const uint8_t * payload = rx_frame_.data() + 4;
-    if (type == kTypeScan && payload_size == kScanPayloadSize) {
+    if (type == 0x16 && payload_size >= 15U && payload_size <= 164U) {
+      std_msgs::msg::UInt8MultiArray packet;
+      packet.data.assign(payload, payload+payload_size);
+      lidar_packet_publisher_->publish(packet);
+    } else if (type == 0x14 && payload_size == 8U && probe_pending_) {
+      if (read_u32_le(payload) == probe_token_) {
+        sensor_clock_.anchor(probe_sent_, steady_clock_.now().seconds(), read_u32_le(payload+4));
+        probe_pending_ = false;
+      }
+    } else if (type == 0x13 && payload_size == kScanPayloadSize+16U) {
+      publish_scan(payload, true);
+    } else if (type == 0x15 && payload_size == kImuPayloadSize+12U) {
+      publish_imu(payload, true);
+    } else if (type == kTypeScan && payload_size == kScanPayloadSize) {
       publish_scan(payload);
     } else if (type == kTypeStatus && payload_size == kStatusPayloadSize) {
       publish_status(payload);
@@ -659,7 +756,72 @@ private:
     }
   }
 
-  void publish_scan(const uint8_t * payload)
+  void send_clock_probe()
+  {
+    if (!temporal_enabled_ || serial_fd_ < 0 || !pending_tx_frame_.empty() ||
+      steady_clock_.now() < serial_command_ready_time_) return;
+    if (probe_pending_ && steady_clock_.now().seconds()-probe_sent_ < 0.5) return;
+    // Probe nunca interrompe quadro de motor. Espera de fila entra no RTT medido.
+    probe_pending_ = true;
+    probe_sent_ = steady_clock_.now().seconds();
+    ++probe_token_;
+    std::vector<uint8_t> frame{kSof1, kSof2, kProtocolVersion, 0x02};
+    append_u16_le(frame, 4U);
+    frame.push_back(probe_token_ & 0xff);
+    frame.push_back((probe_token_ >> 8) & 0xff);
+    frame.push_back((probe_token_ >> 16) & 0xff);
+    frame.push_back((probe_token_ >> 24) & 0xff);
+    append_u16_le(frame, crc16_ccitt(frame.data()+2, frame.size()-2));
+    pending_tx_frame_ = std::move(frame);
+    pending_tx_offset_ = 0;
+    flush_serial_tx();
+  }
+
+  int64_t temporal_stamp(const char * sensor, const uint8_t * payload,
+    std::size_t offset, double lag, const builtin_interfaces::msg::Time &publication)
+  {
+    double age = 0, uncertainty = 0;
+    uint32_t begin = 0, end = 0, queued = 0;
+    if (offset) {
+      begin = read_u32_le(payload+offset);
+      end = read_u32_le(payload+offset+4);
+      queued = read_u32_le(payload+offset+8);
+    }
+    bool valid = temporal_enabled_ && offset && sensor_clock_.oldest(
+      steady_clock_.now().seconds(), begin, end, queued, clock_drift_ppm_, lag, age, uncertainty);
+    int64_t stamp_ns = 0;
+    if (valid) stamp_ns = rclcpp::Time(publication).nanoseconds()-static_cast<int64_t>(age*1e9);
+    if (stamp_ns <= 0) valid = false;
+    const uint32_t geometry = offset == kScanPayloadSize ? read_u32_le(payload+offset+12) : 0;
+    if (offset == kScanPayloadSize && (geometry & 0xffU) != 2U) valid = false;
+    const char * reason = valid ? "ok" : (!temporal_enabled_ ? "disabled" :
+      (!offset ? "legacy_frame" : (clock_drift_ppm_ < 0 || lag < 0 ? "unknown_capture_or_clock_bound" :
+        (!sensor_clock_.anchored ? "clock_unsynchronized" : "stale_or_inconsistent_window"))));
+    std::ostringstream json;
+    json.precision(17);
+    json << "{\"schema\":1,\"sensor\":\"" << sensor << "\",\"valid\":"
+      << (valid ? "true" : "false") << ",\"reason\":\"" << reason << "\",\"timed_frame\":" << (offset ? "true" : "false")
+      << ",\"capture_begin_us\":" << begin << ",\"capture_end_us\":" << end
+      << ",\"queued_us\":" << queued << ",\"age_upper_s\":" << age
+      << ",\"uncertainty_s\":" << uncertainty << ",\"stamp_ns\":" << stamp_ns
+      << ",\"publication_stamp_ns\":" << rclcpp::Time(publication).nanoseconds()
+      << ",\"probe_host_sent_s\":" << sensor_clock_.sent
+      << ",\"probe_host_received_s\":" << sensor_clock_.received
+      << ",\"probe_device_us\":" << sensor_clock_.device
+      << ",\"drift_bound_ppm\":" << clock_drift_ppm_
+      << ",\"capture_lag_bound_s\":" << lag
+      << ",\"scan_capture_schema\":" << (geometry & 0xffU)
+      << ",\"samples_per_packet_min\":" << ((geometry >> 8) & 0xffU)
+      << ",\"samples_per_packet_max\":" << ((geometry >> 16) & 0xffU)
+      << ",\"packets_in_scan\":" << ((geometry >> 24) & 0xffU)
+      << ",\"capture_kind\":\"mcu_receive_or_i2c_window\"}";
+    std_msgs::msg::String msg;
+    msg.data = json.str();
+    timing_publisher_->publish(msg);
+    return valid ? stamp_ns : 0;
+  }
+
+  void publish_scan(const uint8_t * payload, bool timed = false)
   {
     const uint32_t scan_time_us = read_u32_le(payload + 6);
     const uint8_t frequency_x20 = payload[10];
@@ -694,7 +856,15 @@ private:
       }
     }
 
-    scan_publisher_->publish(message);
+    if (!timed) scan_publisher_->publish(message);
+    auto stamp = temporal_stamp("lidar", payload, timed ? kScanPayloadSize : 0U,
+      lidar_capture_lag_, message.header.stamp);
+    if (stamp > 0) {
+      message.header.stamp = rclcpp::Time(stamp);
+      // Bins agregados/invertidos nao possuem ordem temporal conhecida por raio.
+      message.time_increment = 0.0F;
+      scan_temporal_publisher_->publish(message);
+    }
     ++published_scans_;
   }
 
@@ -738,7 +908,7 @@ private:
     publish_diagnostics(status);
   }
 
-  void publish_imu(const uint8_t * payload)
+  void publish_imu(const uint8_t * payload, bool timed = false)
   {
     const int32_t heading_mdeg = read_i32_le(payload + 6);
     const int16_t gyro_z_mrad_s = read_i16_le(payload + 10);
@@ -779,6 +949,12 @@ private:
     message.angular_velocity_covariance[8] = 0.02;
     message.linear_acceleration_covariance[0] = -1.0;
     imu_publisher_->publish(message);
+    auto stamp = temporal_stamp("imu", payload, timed ? kImuPayloadSize : 0U,
+      imu_capture_lag_, message.header.stamp);
+    if (stamp > 0) {
+      message.header.stamp = rclcpp::Time(stamp);
+      imu_temporal_publisher_->publish(message);
+    }
 
     std_msgs::msg::Float64 yaw_message;
     yaw_message.data = yaw_rad * 180.0 / kPi;
@@ -1039,9 +1215,18 @@ private:
     const int effective_minimum_pwm =
       rotation_only ? minimum_rotation_pwm_ : minimum_pwm_;
 
+    // GANHO_LATERAL (12/11): peso do movimento lateral no comando (0 = frente/tras/giro/parado)
+    const double linear_sum = std::abs(commanded_vx_mps_) + std::abs(commanded_vy_mps_);
+    const double lateral_weight = linear_sum > 1e-9 ? std::abs(commanded_vy_mps_) / linear_sum : 0.0;
     std::array<int16_t, 4> pwm{{0, 0, 0, 0}};
     for (std::size_t index = 0; index < pwm.size(); ++index) {
       pwm[index] = wheel_speed_to_pwm(wheel_speed[index], effective_minimum_pwm);
+      const double gain = 1.0 + lateral_weight * (lateral_wheel_gain_[index] - 1.0);
+      if (pwm[index] != 0 && gain != 1.0) {
+        const long scaled = std::lround(std::abs(static_cast<double>(pwm[index])) * gain);
+        const long limited = std::clamp<long>(scaled, effective_minimum_pwm, maximum_pwm_);
+        pwm[index] = static_cast<int16_t>(pwm[index] < 0 ? -limited : limited);
+      }
     }
     return pwm;
   }
@@ -1070,6 +1255,12 @@ private:
 
   void queue_motor_command(const std::array<int16_t, 4> & pwm, uint8_t flags)
   {
+    if ((flags & kFlagEnable) == 0 || std::all_of(pwm.begin(), pwm.end(), [](int16_t v) {return v == 0;})) {
+      geometry_msgs::msg::TwistStamped zero;
+      zero.header.stamp = now();
+      zero.header.frame_id = "base_link";
+      effective_publisher_->publish(zero);
+    }
     if (serial_fd_ < 0 || steady_clock_.now() < serial_command_ready_time_) {
       return;
     }
@@ -1094,6 +1285,9 @@ private:
       host_tx_bytes_ += static_cast<uint64_t>(written);
       pending_tx_offset_ += static_cast<std::size_t>(written);
       if (pending_tx_offset_ == pending_tx_frame_.size()) {
+        std_msgs::msg::UInt8MultiArray bytes;
+        bytes.data = pending_tx_frame_;
+        tx_publisher_->publish(bytes);
         pending_tx_frame_.clear();
         pending_tx_offset_ = 0;
       }
@@ -1123,7 +1317,15 @@ private:
       return;
     }
 
-    queue_motor_command(calculate_motor_pwm(controlled_angular_velocity()), kFlagEnable);
+    const double effective_wz = controlled_angular_velocity();
+    geometry_msgs::msg::TwistStamped effective;
+    effective.header.stamp = now();
+    effective.header.frame_id = "base_link";
+    effective.twist.linear.x = commanded_vx_mps_;
+    effective.twist.linear.y = commanded_vy_mps_;
+    effective.twist.angular.z = effective_wz;
+    effective_publisher_->publish(effective);
+    queue_motor_command(calculate_motor_pwm(effective_wz), kFlagEnable);
   }
 
   void send_emergency_stop_best_effort()
@@ -1208,6 +1410,19 @@ private:
     }
   }
 
+  std::string command_authority_;
+  bool temporal_enabled_{false}, probe_pending_{false};
+  uint32_t probe_token_{0};
+  double probe_sent_{0}, clock_drift_ppm_{-1}, lidar_capture_lag_{-1}, imu_capture_lag_{-1};
+  robo_hardware::SensorClock sensor_clock_;
+  rclcpp::TimerBase::SharedPtr probe_timer_;
+  rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_temporal_publisher_;
+  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_temporal_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr timing_publisher_;
+  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr tx_publisher_;
+  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr rx_publisher_;
+  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr lidar_packet_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr effective_publisher_;
   std::string serial_port_;
   int serial_baud_{500000};
   double serial_startup_delay_s_{5.0};
@@ -1218,6 +1433,7 @@ private:
   int minimum_pwm_{150};
   int minimum_rotation_pwm_{100};
   int maximum_pwm_{215};
+  std::array<double, 4> lateral_wheel_gain_{{1.0, 1.0, 1.0, 1.0}};   // GANHO_LATERAL (12/11): FL FR RL RR
   double command_rate_hz_{20.0};
   double command_timeout_s_{0.25};
   std::string scan_frame_{"laser_raw"};

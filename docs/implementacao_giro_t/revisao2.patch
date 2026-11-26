@@ -1,0 +1,776 @@
+--- a/src/robo_navigation/scripts/giro_frontal.py
++++ b/src/robo_navigation/scripts/giro_frontal.py
+@@ -1,5 +1,8 @@
+ """Nucleo conservador da curva em T; sem dependencias ROS."""
+ import math
++import time
++from dataclasses import dataclass
++from enum import Enum
+ 
+ ZERO = (0.0, 0.0, 0.0)
+ 
+@@ -8,40 +11,114 @@
+     return math.atan2(math.sin(a), math.cos(a))
+ 
+ 
+-def disco_observado(ranges, amin, inc, rmin, rmax, laser, raio, caixa=None):
+-    """Exige retornos FINITOS alem do disco em todos os setores de 2 graus.
+-
+-    Disco circunscrito ao footprint + margem: sobreaproxima toda a varredura.
+-    Raios sem retorno/invalidos e setores cegos permanecem desconhecidos.
+-    No avanco, caixa substitui o disco pelo footprint dilatado + frenagem frontal.
++class Observacao(Enum):
++    LIVRE = 'livre'
++    OBSTACULO = 'obstaculo'
++    DESCONHECIDA = 'desconhecida'
++
++
++def avaliar_varredura(ranges, amin, inc, rmin, rmax, laser, raio, caixa=None):
++    """Cobertura por TODOS os raios nativos, sem preencher setores com vizinhos.
++
++    Resolucao maxima de 0,5 grau, fechamento de 360 graus e nenhum raio invalido.
++    A margem radial de 2,5 cm cobre o espacamento transversal na borda da
++    regiao atual. Nao e uma prova de ausencia de objetos menores que o feixe.
++    Obstaculo tem precedencia sobre desconhecido; infinito nao prova espaco livre.
+     """
+     lx, ly, yaw = laser
+     if not all(math.isfinite(v) for v in (amin, inc, rmin, rmax, lx, ly, yaw, raio)):
+-        return False
+-    if inc == 0 or rmin < 0 or rmax <= rmin or math.hypot(lx, ly) >= raio:
+-        return False
+-    vistos = set()
++        return Observacao.DESCONHECIDA
++    if (len(ranges) < 3 or inc == 0
++            or rmin < 0 or rmax <= rmin or math.hypot(lx, ly) >= raio):
++        return Observacao.DESCONHECIDA
++    # Cobertura deve fechar uma volta, permitindo apenas a celula do ultimo raio.
++    cobertura = abs(inc)*len(ranges)
++    desconhecida = (abs(cobertura-2*math.pi) > 1e-5
++                    or abs(inc) > math.radians(0.5)+1e-8)
++    if caixa is not None:
++        xmin, xmax, ymin, ymax = caixa
++        if not xmin < lx < xmax or not ymin < ly < ymax:
++            return Observacao.DESCONHECIDA
+     for i, r in enumerate(ranges):
+-        a = amin + i * inc + yaw
+-        c, s = math.cos(a), math.sin(a)
+-        b = lx * c + ly * s
++        a = amin+i*inc+yaw
++        c, sn = math.cos(a), math.sin(a)
++        proj = lx*c+ly*sn
+         if caixa is None:
+-            saida = -b + math.sqrt(b*b + raio*raio - lx*lx - ly*ly)
++            saida = -proj+math.sqrt(proj*proj+raio*raio-lx*lx-ly*ly)
+         else:
+-            xmin, xmax, ymin, ymax = caixa
+-            if not xmin < lx < xmax or not ymin < ly < ymax:
+-                return False
+             tx = ((xmax if c > 0 else xmin)-lx)/c if abs(c) > 1e-12 else math.inf
+-            ty = ((ymax if s > 0 else ymin)-ly)/s if abs(s) > 1e-12 else math.inf
++            ty = ((ymax if sn > 0 else ymin)-ly)/sn if abs(sn) > 1e-12 else math.inf
+             saida = min(tx, ty)
+-        # Um retorno antes da borda e obstaculo, inclusive dentro do corpo.
+         if not math.isfinite(r) or not rmin <= r <= rmax:
+-            continue
+-        if r <= saida + 0.025:
++            desconhecida = True
++        elif r <= saida+0.025:
++            return Observacao.OBSTACULO
++    return Observacao.DESCONHECIDA if desconhecida else Observacao.LIVRE
++
++
++def disco_observado(*args, **kwargs):
++    return avaliar_varredura(*args, **kwargs) is Observacao.LIVRE
++
++
++@dataclass(frozen=True)
++class TempoSensor:
++    stamp_ns: int          # carimbo original, nunca substituido por recepcao
++    ros_rx_ns: int
++    mono_rx: float
++    atraso_pre_stamp: float
++
++    @classmethod
++    def receber(cls, stamp, ros_ns, mono, atraso=0.0, anterior=None):
++        sec, nano = getattr(stamp, 'sec', None), getattr(stamp, 'nanosec', None)
++        if (not isinstance(sec, int) or not isinstance(nano, int) or sec < 0
++                or not 0 <= nano < 1_000_000_000 or sec+nano == 0
++                or not math.isfinite(atraso) or atraso < 0):
++            return None
++        ns = sec*1_000_000_000+nano
++        if ns > ros_ns or (anterior is not None and ns <= anterior):
++            return None
++        sample = cls(ns, ros_ns, mono, atraso)
++        return sample if sample.recente(ros_ns, mono) else None
++
++    @property
++    def aquisicao_mono(self):
++        return self.mono_rx-(self.ros_rx_ns-self.stamp_ns)/1e9-self.atraso_pre_stamp
++
++    def recente(self, ros_ns, mono, limite=0.3):
++        elapsed = mono-self.mono_rx
++        ros_elapsed = (ros_ns-self.ros_rx_ns)/1e9
++        # Mudanca de relogio/pausa simulada nao renova a validade.
++        if elapsed < 0 or abs(ros_elapsed-elapsed) > 0.05:
+             return False
+-        x, y = lx + saida*c, ly + saida*s
+-        vistos.add(int(((math.atan2(y, x) + math.pi) % (2*math.pi)) / (2*math.pi) * 180))
+-    return len(vistos) == 180
++        idade = max(mono-self.aquisicao_mono,
++                    (ros_ns-self.stamp_ns)/1e9+self.atraso_pre_stamp)
++        return 0 <= idade <= limite
++
++
++def devolver_controle(cliente, pedido, publicar_zero, relogio=time.monotonic,
++                      esperar=time.sleep, timeout=1.0):
++    """RPC de devolucao para estado PARADO; jamais presume sucesso por timeout.
++
++    Publica somente na entrada experimental durante a espera. O servidor estaciona
++    antes de responder, e seu watchdog estaciona se a requisicao nao chegar.
++    Resposta tardia e idempotente e nao desbloqueia fontes normais.
++    """
++    try:
++        futuro = cliente.call_async(pedido)
++        limite = relogio()+timeout
++        while not futuro.done():
++            publicar_zero()
++            if relogio() >= limite:
++                return False, 'timeout na devolucao'
++            esperar(0.02)
++        resposta = futuro.result()
++        if resposta is None or not resposta.success or resposta.message != 'parado_confirmado':
++            return False, 'devolucao recusada ou estado nao confirmado'
++        return True, ''
++    except Exception as exc:
++        return False, 'excecao na devolucao: '+str(exc)
++    finally:
++        publicar_zero()
+ 
+ 
+ class GiroFrontal:
+@@ -138,9 +215,11 @@
+     def __init__(self):
+         self.ativo = self.falha = False
+         self.ultimo_normal = self.ultimo_t = None
++        self.estacionado = False
++        self.zero_desde = None
+ 
+     def adquirir(self, t):
+-        if self.ativo or self.falha or (self.ultimo_normal is not None and t-self.ultimo_normal < 0.6):
++        if self.ativo or self.falha or self.estacionado or (self.ultimo_normal is not None and t-self.ultimo_normal < 0.6):
+             return False
+         self.ativo, self.falha, self.ultimo_t = True, False, t
+         return True
+@@ -150,22 +229,39 @@
+             self.ultimo_normal = t
+             if self.ativo:
+                 self.falha = True
+-        return ZERO if self.ativo or self.falha else cmd
++        return ZERO if self.ativo or self.falha or self.estacionado else cmd
+ 
+     def experimental(self, t, cmd):
+         if not self.ativo:
+             return ZERO
+         self.ultimo_t = t
++        if cmd == ZERO:
++            if self.zero_desde is None:
++                self.zero_desde = t
++        else:
++            self.zero_desde = None
+         return ZERO if self.falha else cmd
+ 
+     def vigiar(self, t):
+         if self.ativo and t-self.ultimo_t > 0.25:
+-            self.falha = True
++            self.falha, self.estacionado, self.ativo = True, True, False
+         return self.ativo
++
++    def liberar(self, t):
++        # Idempotencia permite recuperar uma resposta perdida sem reativar nada.
++        if self.estacionado:
++            return not self.falha
++        ok = (self.ativo and not self.falha and self.zero_desde is not None
++              and t-self.zero_desde >= 0.2 and t-self.ultimo_t <= 0.25)
++        self.ativo, self.estacionado = False, True
++        self.falha = self.falha or not ok
++        return ok
+ 
+     def resetar(self, t):
+         # Somente apos o operador cancelar as fontes normais e confirmar a area.
+-        if self.ultimo_normal is not None and t-self.ultimo_normal < 0.6:
++        if (self.ativo or (self.ultimo_t is not None and t-self.ultimo_t < 0.6)
++                or (self.ultimo_normal is not None and t-self.ultimo_normal < 0.6)):
+             return False
+-        self.ativo = self.falha = False
++        self.ativo = self.falha = self.estacionado = False
++        self.zero_desde = None
+         return True
+--- a/src/robo_navigation/scripts/arbitro_t.py
++++ b/src/robo_navigation/scripts/arbitro_t.py
+@@ -37,9 +37,9 @@
+         def normal(self, m):
+             cmd = self.a.normal(time.monotonic(), self.cmd(m))
+             # Zeros tardios do Nav2 nao interrompem a realimentacao experimental.
+-            if not self.a.ativo and not self.a.falha:
++            if not self.a.ativo and not self.a.falha and not self.a.estacionado:
+                 self.pub.publish(m)
+-            elif self.a.falha:
++            elif self.a.falha or self.a.estacionado:
+                 self.enviar(cmd)
+ 
+         def experimental(self, m):
+@@ -51,9 +51,9 @@
+                 res.success = self.a.adquirir(time.monotonic())
+             else:
+                 self.enviar(ZERO)
+-                self.a.ativo = False
+-                res.success = True
+-            res.message = 'controle exclusivo' if res.success else 'entrada ocupada'
++                res.success = self.a.liberar(time.monotonic())
++            res.message = (('controle exclusivo' if req.data else 'parado_confirmado')
++                           if res.success else 'entrada ocupada/falha')
+             return res
+ 
+         def resetar(self, req, res):
+@@ -64,7 +64,7 @@
+ 
+         def tick(self):
+             self.a.vigiar(time.monotonic())
+-            if self.a.ativo and self.a.falha:
++            if self.a.falha or self.a.estacionado:
+                 self.enviar(ZERO)
+             m = Bool()
+             m.data = self.a.falha
+--- a/src/robo_navigation/scripts/alinhador_passagem.py
++++ b/src/robo_navigation/scripts/alinhador_passagem.py
+@@ -188,7 +188,8 @@
+ import os
+ import threading
+ import time
+-from giro_frontal import GiroFrontal, disco_observado
++from giro_frontal import (GiroFrontal, TempoSensor, Observacao, avaliar_varredura,
++                          devolver_controle)
+ 
+ # ---------------------------------------------------------------------------
+ # Nucleo geometrico (sem ROS: pode ser testado fora do robo)
+@@ -2254,6 +2255,10 @@
+             # v3: travessia pelo LiDAR ('lidar') ou pelo Nav2 como na v2 ('nav2')
+             self.declare_parameter('modo_travessia', 'lidar')
+             self.declare_parameter('modo_curva_t', 'lateral')
++            # Driver carimba na PUBLICACAO. -1 = atraso anterior desconhecido:
++            # experimental bloqueado ate obter limites confiaveis, nunca adivinhar.
++            self.declare_parameter('atraso_lidar_pre_stamp_max_t', -1.0)
++            self.declare_parameter('atraso_imu_pre_stamp_max_t', -1.0)
+             if self.get_parameter('modo_curva_t').value not in ('lateral', 'giro_frontal'):
+                 raise ValueError('modo_curva_t deve ser lateral ou giro_frontal')
+             self.declare_parameter('sensor_idade_max', 0.5)     # SENSOR_PARADO
+@@ -2310,6 +2315,8 @@
+             self.tf_buffer = Buffer()
+             self.tf_listener = TransformListener(self.tf_buffer, self)
+             self.rota_tent = {}   # ROTA_MAPA
++            self.tempos_t = {}
++            self.ultimos_stamps_t = {}
+             self.odom_t_valido = False
+             self.imu_t = None
+             self.scan_t_raw = None
+@@ -2378,19 +2385,29 @@
+                 self.conflito_t = (time.monotonic(), msg.data)
+ 
+         def _stamp_recente(self, stamp):
+-            idade = (self.get_clock().now().nanoseconds -
+-                     (stamp.sec * 1000000000 + stamp.nanosec)) / 1e9
+-            return 0 <= idade <= 0.3
++            return TempoSensor.receber(stamp, self.get_clock().now().nanoseconds,
++                                       time.monotonic()) is not None
++
++        def _tempo_sensor_t(self, msg, sensor, atraso=0.0):
++            with self.lock:
++                amostra = TempoSensor.receber(msg.header.stamp,
++                    self.get_clock().now().nanoseconds, time.monotonic(), atraso,
++                    self.ultimos_stamps_t.get(sensor))
++                self.tempos_t[sensor] = amostra
++                if amostra is not None:
++                    self.ultimos_stamps_t[sensor] = amostra.stamp_ns
++            return amostra
+ 
+         def ao_imu(self, msg):   # SENSOR_PARADO
+             q = msg.orientation
+             valores = (q.x, q.y, q.z, q.w, msg.angular_velocity.z)
+-            valida = (self._stamp_recente(msg.header.stamp)
++            amostra = self._tempo_sensor_t(msg, 'imu', self.p('atraso_imu_pre_stamp_max_t'))
++            valida = (amostra is not None
+                       and msg.orientation_covariance[0] != -1
+                       and all(math.isfinite(v) for v in valores)
+                       and abs(sum(v*v for v in valores[:4])-1.0) < 0.05)
+             with self.lock:
+-                self.imu_t = (time.monotonic(), yaw_de(q), msg.angular_velocity.z) if valida else None
++                self.imu_t = (amostra.aquisicao_mono, yaw_de(q), msg.angular_velocity.z) if valida else None
+             self.t_imu = time.monotonic()
+             self.gyro_z = msg.angular_velocity.z   # ANGULO_FUNDIDO
+ 
+@@ -2459,7 +2476,7 @@
+                 nome, ap['x'], ap['y'], math.degrees(ap['yaw'])))
+ 
+         def ao_odom(self, msg):
+-            self.odom_t_valido = self._stamp_recente(msg.header.stamp)
++            self.odom_t_valido = self._tempo_sensor_t(msg, 'odom') is not None
+             p = msg.pose.pose
+             with self.lock:
+                 self.odom = (time.monotonic(), p.position.x, p.position.y, yaw_de(p.orientation))
+@@ -2471,6 +2488,7 @@
+                 self.hist_cmd.append((time.monotonic(), tw.linear.x, tw.linear.y, tw.angular.z))
+ 
+         def ao_cmd_final(self, msg):
++            self._tempo_sensor_t(msg, 'saida')
+             tw = msg.twist
+             zerado = abs(tw.linear.x) < 1e-4 and abs(tw.linear.y) < 1e-4 and abs(tw.angular.z) < 1e-4
+             with self.lock:
+@@ -2480,6 +2498,19 @@
+             self.cm_stop = msg.action_type == 1  # STOP
+ 
+         def ao_scan(self, msg):
++            # A ordem angular dos bins nao representa a ordem de aquisicao do
++            # driver. Usa a idade do raio MAIS ANTIGO, sem deskew ficticio.
++            duracao = getattr(msg, 'scan_time', math.nan)
++            incremento = getattr(msg, 'time_increment', math.nan)
++            n = len(getattr(msg, 'ranges', ()))
++            atraso = self.p('atraso_lidar_pre_stamp_max_t')
++            if (not math.isfinite(duracao) or not 0.05 <= duracao <= 1.0
++                    or not math.isfinite(incremento) or incremento <= 0 or n < 3
++                    or abs(incremento*n-duracao) > 0.05*duracao or atraso < 0):
++                atraso = math.nan
++            else:
++                atraso += max(duracao, incremento*(n-1))
++            amostra = self._tempo_sensor_t(msg, 'lidar', atraso)
+             if not self._stamp_recente(msg.header.stamp):
+                 with self.lock:
+                     self.scan_t_raw = None
+@@ -2504,8 +2535,9 @@
+             frente = min([p[0] - 0.365 for p in pts if p[0] > 0.30 and abs(p[1]) < 0.33] or [9.0])
+             with self.lock:
+                 od = self.odom
+-                self.scan_t_raw = (time.monotonic(), tuple(msg.ranges), msg.angle_min,
++                self.scan_t_raw = ((amostra.aquisicao_mono, tuple(msg.ranges), msg.angle_min,
+                                    msg.angle_increment, msg.range_min, msg.range_max, self.laser_tf)
++                                   if amostra is not None else None)
+                 self.scan = (time.monotonic(), pts, od[1:] if od else None, frente)
+                 self.scan_seq += 1
+ 
+@@ -3263,6 +3295,18 @@
+             self.get_logger().info('%s (LiDAR): %s' % (nome, 'SUCESSO' if ok else 'FALHOU - ' + trav.motivo))
+             return 'ok' if ok else 'falha'
+ 
++        def _precondicoes_t(self):
++            # Recusa antes de iniciar o preparo de uma curva experimental.
++            with self.lock:
++                tempos, raw = dict(self.tempos_t), self.scan_t_raw
++            agora, ros_ns = time.monotonic(), self.get_clock().now().nanoseconds
++            return (all(tempos.get(sensor) is not None
++                        and tempos[sensor].recente(ros_ns, agora)
++                        for sensor in ('lidar', 'imu', 'odom'))
++                    and raw is not None and len(raw[1]) >= 720
++                    and 0 < abs(raw[3]) <= math.radians(0.5)+1e-8
++                    and abs(abs(raw[3])*len(raw[1])-2*math.pi) <= 1e-5)
++
+         def _arbitro_exclusivo(self):
+             saidas = self.get_publishers_info_by_topic('/cmd_vel_nav_seguro')
+             entradas = self.get_publishers_info_by_topic('/cmd_vel_nav_t')
+@@ -3308,10 +3352,11 @@
+                 self.controle_t_ativo = True
+                 self._parar()
+                 while rclpy.ok():
+-                    agora = time.monotonic()
+                     with self.lock:
+                         od, raw, imu, cf, conflito = (self.odom, self.scan_t_raw, self.imu_t,
+                                                      self.cmd_final, self.conflito_t)
++                        tempos = dict(self.tempos_t)
++                    agora = time.monotonic()
+                     pm = self._pose_mapa_yaw(idade_max=0.3)
+                     if not self.odom_t_valido or od is None or not 0 <= agora-od[0] <= 0.3:
+                         pm = None
+@@ -3319,8 +3364,19 @@
+                     # em 5 cm e mais 12 cm a frente para latencia/frenagem.
+                     raio = math.hypot(0.365, 0.315)+0.05
+                     caixa = (-0.255, 0.535, -0.365, 0.365) if gf.estado == 'avancar' else None
+-                    livre = raw is not None and disco_observado(*raw[1:], raio, caixa=caixa)
+-                    cmd = gf.passo(agora, pm, imu, raw[0] if raw else None, livre,
++                    observacao = (avaliar_varredura(*raw[1:], raio, caixa=caixa)
++                                  if raw is not None else Observacao.DESCONHECIDA)
++                    agora = time.monotonic()
++                    ros_ns = self.get_clock().now().nanoseconds
++                    recentes = all(tempos.get(nome_sensor) is not None
++                                   and tempos[nome_sensor].recente(ros_ns, agora)
++                                   for nome_sensor in ('lidar', 'imu', 'odom', 'saida'))
++                    if not recentes:
++                        gf.abortar('idade total invalida/atraso de aquisicao desconhecido')
++                    elif observacao is not Observacao.LIVRE:
++                        gf.abortar('area varrida: '+observacao.value)
++                    cmd = gf.passo(agora, pm, imu, raw[0] if raw else None,
++                                   observacao is Observacao.LIVRE,
+                                    agora-cf[0] <= 0.3 and cf[1],
+                                    cancelado=self._novo_goal_chegou(),
+                                    bloqueado=(self.cm_stop or conflito[1] or agora-conflito[0] > 0.3
+@@ -3332,18 +3388,13 @@
+             finally:
+                 self._parar()
+                 if adquirido and gf.estado == 'fim':
+-                    # So sucesso libera automaticamente. Falhas deixam lease/watchdog
+-                    # travados em zero ate reset manual, impedindo retomada concorrente.
+-                    limite = time.monotonic()+0.3
+-                    while time.monotonic() < limite:
+-                        self._publicar_vel(0.0, 0.0, 0.0)
+-                        time.sleep(0.05)
+                     req = SetBool.Request()
+                     req.data = False
+-                    f = self.controle_t.call_async(req)
+-                    limite = time.monotonic()+1.0
+-                    while not f.done() and time.monotonic() < limite:
+-                        time.sleep(0.02)
++                    confirmado, motivo = devolver_controle(self.controle_t, req,
++                        lambda: self._publicar_vel(0.0, 0.0, 0.0))
++                    if not confirmado:
++                        gf.abortar(motivo)
++                # Em falha, watchdog estaciona o arbitro sem liberar fontes normais.
+                 self.controle_t_ativo = False
+                 self.get_logger().info('%s giro frontal: %s %s' % (nome, gf.estado, gf.motivo))
+             return 'ok' if gf.estado == 'fim' else 'falha'
+@@ -3647,6 +3698,12 @@
+                             info['eixo_graus'], info['largura_mapa'], info['distancia_preparo']))
+                     self._publicar_etapas(etapas)
+                     e = etapas[0]
++                    if (info.get('curva') is not None and self.p('modo_curva_t') == 'giro_frontal'
++                            and not self._precondicoes_t()):
++                        self._parar()
++                        self.get_logger().error('Curva experimental recusada antes do preparo: '
++                            'idade de aquisicao desconhecida/antiga ou resolucao LiDAR insuficiente')
++                        return
+                     ok = self._chegar_preparo(e, 'PREPARO %d (alinhar fora da passagem)' % len(tratadas)) == 'ok'
+                     if ok:
+                         # De perto o mapa da passagem fica melhor: refina uma vez.
+@@ -3709,6 +3766,13 @@
+                             else:
+                                 r = self._travessia_lateral(curva, 'CURVA %d' % n)
+                             if r == 'ok':
++                                if self.p('modo_curva_t') == 'giro_frontal':
++                                    self.get_logger().info('Curva concluida e devolucao confirmada: '
++                                        'arbitro parado. Retome explicitamente apos conferir a area.')
++                                    if area is not None:
++                                        self._publicar_resultado(area, False,
++                                            'curva concluida; missao interrompida para retomada supervisionada')
++                                    return
+                                 tratadas.append(curva['entrada_b'])
+                                 continue  # reanalisa o caminho a partir da saida do corredor novo
+                             self.get_logger().error(
+--- a/src/robo_navigation/launch/navigation.launch.py
++++ b/src/robo_navigation/launch/navigation.launch.py
+@@ -94,6 +94,8 @@
+ 
+     return LaunchDescription(
+         [
++            DeclareLaunchArgument("atraso_lidar_pre_stamp_max_t", default_value="-1.0"),
++            DeclareLaunchArgument("atraso_imu_pre_stamp_max_t", default_value="-1.0"),
+             DeclareLaunchArgument("modo_curva_t", default_value="lateral",
+                                   choices=["lateral", "giro_frontal"]),
+             DeclareLaunchArgument(
+@@ -200,7 +202,11 @@
+             ExecuteProcess(  # NAV_TUDO: alinhador: passagens, mesas, START/FINISH
+                 cmd=["python3", os.path.expanduser(
+                     "~/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py"),
+-                     "--ros-args", "-p", ["modo_curva_t:=", modo_curva_t]],
++                     "--ros-args", "-p", ["modo_curva_t:=", modo_curva_t],
++                     "-p", ["atraso_lidar_pre_stamp_max_t:=",
++                            LaunchConfiguration("atraso_lidar_pre_stamp_max_t")],
++                     "-p", ["atraso_imu_pre_stamp_max_t:=",
++                            LaunchConfiguration("atraso_imu_pre_stamp_max_t")]],
+                 output="screen",
+             ),
+             ExecuteProcess(  # SUAVIZADOR_NAV: /cmd_vel_ctrl -> /cmd_vel_nav
+--- a/src/robo_navigation/test/test_giro_frontal.py
++++ b/src/robo_navigation/test/test_giro_frontal.py
+@@ -5,7 +5,8 @@
+ 
+ SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
+ sys.path.insert(0, str(SCRIPTS))
+-from giro_frontal import GiroFrontal, ArbitragemT, disco_observado, ZERO
++from giro_frontal import (GiroFrontal, ArbitragemT, disco_observado, ZERO,
++                          TempoSensor, Observacao, avaliar_varredura, devolver_controle)
+ from alinhador_passagem import Encosto, TravessiaLateral
+ 
+ 
+@@ -261,11 +262,15 @@
+         def twist():
+             return NS(header=NS(stamp=None, frame_id=''),
+                       twist=NS(linear=NS(x=0, y=0), angular=NS(z=0)))
+-        ns = dict(Node=object, time=time, math=math, TwistStamped=twist,
++        ns = dict(Node=object, time=time, math=math, TempoSensor=TempoSensor,
++                  TwistStamped=twist,
+                   yaw_de=lambda q: 2*math.atan2(q.z, q.w))
+         exec(compile(module, str(SCRIPTS/'alinhador_passagem.py'), 'exec'), ns)
++        self.ns = ns
+         self.node = ns['Alinhador'].__new__(ns['Alinhador'])
+         self.node.lock = threading.Lock()
++        self.node.tempos_t, self.node.ultimos_stamps_t = {}, {}
++        self.node.p = lambda name: 0.0
+         self.node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=10_000_000_000,
+                                                          to_msg=lambda: 'stamp'))
+ 
+@@ -311,6 +316,259 @@
+         pubs['/cmd_vel_nav_seguro'].append(self.NS(node_name='intruso'))
+         self.assertFalse(self.node._arbitro_exclusivo())
+ 
++    def test_callback_imu_nao_renova_029_para_058(self):
++        self.node.get_clock = lambda: self.NS(now=lambda: self.NS(nanoseconds=10_290_000_000))
++        msg = self.NS(header=self.NS(stamp=self.NS(sec=10, nanosec=0)),
++                      orientation=self.NS(x=0, y=0, z=0, w=1),
++                      angular_velocity=self.NS(z=0), orientation_covariance=[0]*9)
++        self.node.ao_imu(msg)
++        sample = self.node.tempos_t['imu']
++        self.assertIsNotNone(sample)
++        self.assertAlmostEqual(sample.mono_rx-self.node.imu_t[0], 0.29)
++        self.assertFalse(sample.recente(10_580_000_000, sample.mono_rx+0.29))
++
++    def test_scan_desconta_duracao_sem_reescrever_header(self):
++        self.node.laser_tf = (0, 0, 0)
++        self.node.odom, self.node.scan_seq = None, 0
++        self.node.get_clock = lambda: self.NS(now=lambda: self.NS(nanoseconds=10_050_000_000))
++        msg = self.NS(header=self.NS(stamp=self.NS(sec=10, nanosec=0)),
++                      scan_time=0.17, time_increment=0.17/180,
++                      angle_min=-math.pi, angle_increment=math.pi/90,
++                      range_min=0.05, range_max=10, ranges=[2.0]*180)
++        self.node.p = lambda name: 0.02
++        self.node.ao_scan(msg)
++        sample = self.node.tempos_t['lidar']
++        self.assertAlmostEqual(sample.mono_rx-self.node.scan_t_raw[0], 0.24)
++        self.assertEqual(msg.header.stamp.sec, 10)
++        self.assertEqual(msg.header.stamp.nanosec, 0)
++        self.assertEqual(sample.stamp_ns, 10_000_000_000)
++        self.node.p = lambda name: -1.0
++        self.node.ao_scan(msg)
++        self.assertIsNone(self.node.scan_t_raw)
++
++    def test_precondicao_recusa_driver_180_bins_antes_do_preparo(self):
++        import time
++        stamp = self.NS(sec=10, nanosec=0)
++        sample = TempoSensor.receber(stamp, 10_000_000_000, time.monotonic())
++        self.node.tempos_t = dict(lidar=sample, imu=sample, odom=sample)
++        self.node.scan_t_raw = (sample.aquisicao_mono, [2]*180, -math.pi,
++                                math.pi/90, 0.05, 10, (0, 0, 0))
++        self.assertFalse(self.node._precondicoes_t())
++        self.node.scan_t_raw = (sample.aquisicao_mono, [2]*720, -math.pi,
++                                math.pi/360, 0.05, 10, (0, 0, 0))
++        self.assertTrue(self.node._precondicoes_t())
++        self.node.tempos_t['lidar'] = None
++        self.assertFalse(self.node._precondicoes_t())
++
++    def test_rotina_real_nao_retorna_ok_sem_devolucao(self):
++        for modo in ('sucesso', 'recusa', 'sem_resposta', 'excecao'):
++            with self.subTest(modo=modo):
++                a, clock = ArbitragemT(), [0.0]
++                def esperar(dt):
++                    clock[0] += dt
++                def mandar(*cmd):
++                    a.experimental(clock[0], cmd)
++                def parar():
++                    for _ in range(5):
++                        mandar(*ZERO)
++                        esperar(0.05)
++                def completo(*args, **kwargs):
++                    g = GiroFrontal(*args, **kwargs)
++                    g.estado = 'fim'  # simula somente a chegada, testa finally real
++                    return g
++                def enviar(req):
++                    if req.data:
++                        ok = a.adquirir(clock[0])
++                        return self.NS(done=lambda: True, result=lambda: self.NS(success=ok))
++                    if modo == 'excecao':
++                        raise RuntimeError('RPC')
++                    if modo == 'sem_resposta':
++                        return self.NS(done=lambda: False)
++                    ok = a.liberar(clock[0]) if modo == 'sucesso' else False
++                    return self.NS(done=lambda: True, result=lambda: self.NS(
++                        success=ok, message='parado_confirmado' if ok else 'recusado'))
++                self.ns.update(GiroFrontal=completo, rclpy=self.NS(ok=lambda: False),
++                               SetBool=self.NS(Request=lambda: self.NS(data=False)),
++                               time=self.NS(monotonic=lambda: clock[0], sleep=esperar),
++                               devolver_controle=lambda *args: devolver_controle(*args,
++                                   relogio=lambda: clock[0], esperar=esperar, timeout=0.1))
++                self.node.controle_t = self.NS(wait_for_service=lambda **kw: True, call_async=enviar)
++                self.node._arbitro_exclusivo = lambda: True
++                self.node.handle_ativo = None
++                self.node._parar, self.node._publicar_vel = parar, mandar
++                self.node.get_logger = lambda: self.NS(info=lambda _: None)
++                r = self.node._travessia_giro_frontal(
++                    dict(juncao=(0, 0), eixo_b=(0, 1), saida_b=(0, 1)), 'teste')
++                self.assertEqual(r, 'ok' if modo == 'sucesso' else 'falha')
++                a.vigiar(clock[0]+0.3)
++                self.assertFalse(a.ativo)
++                self.assertEqual(a.normal(clock[0]+0.4, (0.1, 0, 0)), ZERO)
++
++
++
++class TestTempoTotal(unittest.TestCase):
++    def stamp(self, value):
++        from types import SimpleNamespace
++        return SimpleNamespace(sec=int(value), nanosec=round((value-int(value))*1e9))
++
++    def test_recente_preserva_stamp_original(self):
++        t = TempoSensor.receber(self.stamp(10), 10_100_000_000, 100)
++        self.assertEqual(t.stamp_ns, 10_000_000_000)
++        self.assertAlmostEqual(t.aquisicao_mono, 99.9)
++        self.assertTrue(t.recente(10_200_000_000, 100.1))
++
++    def test_regressao_058_segundos(self):
++        t = TempoSensor.receber(self.stamp(10), 10_290_000_000, 100)
++        self.assertIsNotNone(t)
++        self.assertFalse(t.recente(10_580_000_000, 100.29))
++        g = GiroFrontal((0, 0), (0, 1), (0, 1))
++        self.assertEqual(g.passo(100.29, (0, 0, 0), (t.aquisicao_mono, 0, 0),
++                                 t.aquisicao_mono, True, True), ZERO)
++        self.assertEqual(g.estado, 'abortar')
++
++    def test_atrasado_ja_na_recebida(self):
++        self.assertIsNone(TempoSensor.receber(self.stamp(10), 10_310_000_000, 100))
++
++    def test_nulo_futuro_negativo_malformado_repetido(self):
++        from types import SimpleNamespace as NS
++        for stamp in (None, NS(sec=0, nanosec=0), NS(sec=-1, nanosec=0),
++                      NS(sec=10, nanosec=-1), NS(sec=10, nanosec=1_000_000_000),
++                      NS(sec=11, nanosec=0)):
++            self.assertIsNone(TempoSensor.receber(stamp, 10_000_000_000, 100))
++        self.assertIsNone(TempoSensor.receber(self.stamp(10), 10_000_000_000, 100,
++                                             anterior=10_000_000_000))
++        self.assertIsNone(TempoSensor.receber(self.stamp(10), 10_000_000_000, 100,
++                                             anterior=10_010_000_000))
++
++    def test_salto_e_pausa_de_relogio(self):
++        t = TempoSensor.receber(self.stamp(10), 10_000_000_000, 100)
++        for ros, mono in ((9_900_000_000, 100.1), (10_500_000_000, 100.1),
++                          (10_000_000_000, 100.2), (10_000_000_000, 99)):
++            self.assertFalse(t.recente(ros, mono))
++
++    def test_driver_publicacao_inclui_varredura_e_fila(self):
++        # Scan 0.17 s + fila limitada a 0.02 + entrega 0.05 = idade 0.24.
++        t = TempoSensor.receber(self.stamp(10), 10_050_000_000, 100, atraso=0.19)
++        self.assertIsNotNone(t)
++        self.assertTrue(t.recente(10_090_000_000, 100.04))
++        self.assertFalse(t.recente(10_150_000_000, 100.1))
++        for atraso in (-1, float('nan'), float('inf'), 0.31):
++            self.assertIsNone(TempoSensor.receber(self.stamp(10), 10_000_000_000, 100,
++                                                 atraso=atraso))
++
++
++class TestGeometriaRevisao2(unittest.TestCase):
++    def avaliar(self, r, inc=math.pi/360):
++        return avaliar_varredura(r, -math.pi, inc, 0.05, 10, (0, 0, 0), 0.54)
++
++    def test_um_raio_invalido_nao_e_preenchido_por_vizinho(self):
++        r = [2.0]*720
++        for valor in (float('nan'), float('inf'), 0.01, 11.0):
++            r[100] = valor
++            self.assertEqual(self.avaliar(r), Observacao.DESCONHECIDA)
++
++    def test_uma_amostra_por_setor_nao_certifica_setor(self):
++        self.assertEqual(self.avaliar([2.0]*180, math.pi/90), Observacao.DESCONHECIDA)
++        r = [float('nan')]*720
++        r[::4] = [2.0]*180
++        self.assertEqual(self.avaliar(r), Observacao.DESCONHECIDA)
++
++    def test_livre_obstaculo_desconhecido_distintos(self):
++        self.assertEqual(self.avaliar([2.0]*720), Observacao.LIVRE)
++        r = [float('nan')]*720
++        r[300] = 0.4
++        self.assertEqual(self.avaliar(r), Observacao.OBSTACULO)
++        self.assertEqual(self.avaliar([2.0]*600), Observacao.DESCONHECIDA)
++        self.assertEqual(self.avaliar([2.0]*720, 0), Observacao.DESCONHECIDA)
++
++    def test_obstaculo_tem_precedencia_em_scan_de_baixa_resolucao(self):
++        r = [2.0]*180
++        r[100] = 0.4
++        self.assertEqual(self.avaliar(r, math.pi/90), Observacao.OBSTACULO)
++
++    def test_geometria_invalida_e_desconhecida(self):
++        self.assertEqual(avaliar_varredura([2]*720, -math.pi, math.pi/360,
++                                          0.05, 10, (1, 0, 0), 0.54), Observacao.DESCONHECIDA)
++
++
++class TestDevolucao(unittest.TestCase):
++    def executar(self, modo):
++        from types import SimpleNamespace as NS
++        a = ArbitragemT()
++        a.adquirir(0)
++        a.experimental(0, ZERO)
++        a.experimental(0.2, ZERO)
++        a.experimental(0.3, ZERO)
++        relogio = [0.3]
++        zeros = []
++        def publicar():
++            zeros.append(ZERO)
++            a.experimental(relogio[0], ZERO)
++        def esperar(dt):
++            relogio[0] += dt
++        class Cliente:
++            def call_async(self, req):
++                if modo == 'excecao_envio':
++                    raise RuntimeError('envio')
++                if modo == 'sem_resposta':
++                    return NS(done=lambda: False)
++                if modo == 'resposta_perdida':
++                    a.liberar(relogio[0])
++                    return NS(done=lambda: False)
++                if modo == 'excecao_futuro':
++                    def erro():
++                        raise RuntimeError('futuro')
++                    return NS(done=lambda: True, result=erro)
++                if modo == 'sucesso':
++                    ok = a.liberar(relogio[0])
++                    return NS(done=lambda: True, result=lambda: NS(success=ok, message='parado_confirmado'))
++                return NS(done=lambda: True, result=lambda: NS(success=False, message='recusado'))
++        resultado = devolver_controle(Cliente(), NS(data=False), publicar,
++                                      relogio=lambda: relogio[0], esperar=esperar, timeout=0.1)
++        a.vigiar(relogio[0]+0.3)
++        return resultado, a, zeros
++
++    def test_sucesso_somente_apos_estado_parado_confirmado(self):
++        (ok, motivo), a, zeros = self.executar('sucesso')
++        self.assertTrue(ok)
++        self.assertEqual(motivo, '')
++        self.assertFalse(a.ativo)
++        self.assertTrue(a.estacionado)
++        self.assertTrue(zeros)
++        self.assertEqual(a.normal(2, (0.1, 0, 0)), ZERO)
++        self.assertTrue(a.liberar(2))  # idempotente sem reativar fontes
++
++    def test_falha_timeout_e_excecoes_nao_sao_sucesso(self):
++        for modo in ('recusa', 'sem_resposta', 'excecao_envio', 'excecao_futuro', 'resposta_perdida'):
++            with self.subTest(modo=modo):
++                (ok, motivo), a, zeros = self.executar(modo)
++                self.assertFalse(ok)
++                self.assertTrue(motivo)
++                self.assertTrue(zeros)
++                self.assertFalse(a.ativo)
++                self.assertEqual(a.normal(3, (0.1, 0, 0)), ZERO)
++                self.assertEqual(a.experimental(3, (0.1, 0, 0)), ZERO)
++
++    def test_release_sem_parada_falha_fechado(self):
++        a = ArbitragemT()
++        a.adquirir(0)
++        a.experimental(0.1, (0, 0, 0.1))
++        self.assertFalse(a.liberar(0.2))
++        self.assertFalse(a.ativo)
++        self.assertTrue(a.estacionado)
++        self.assertTrue(a.falha)
++
++    def test_reset_nao_libera_manobra_ativa_e_exige_silencio(self):
++        a = ArbitragemT()
++        a.adquirir(0)
++        self.assertFalse(a.resetar(0.1))
++        a.experimental(0.1, ZERO)
++        a.experimental(0.4, ZERO)
++        self.assertTrue(a.liberar(0.4))
++        self.assertFalse(a.resetar(0.5))
++        self.assertTrue(a.resetar(1.1))
++        self.assertEqual(a.normal(1.2, (0.1, 0, 0)), (0.1, 0, 0))
++
+ 
+ if __name__ == '__main__':
+     unittest.main()

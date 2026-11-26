@@ -1,0 +1,52 @@
+{
+  "head": "72013674bd5b00a5e1509b4c4fb7592362c2d1da",
+  "snapshot_sha256": "9965d23dc460381020f95a83fecadc2eb11e839b04fa2c78d1d18c182a8b28e2",
+  "modificados_rodada": [
+    {
+      "path": "src/robo_navigation/CMakeLists.txt",
+      "sha256": "bdd174b8b35ca1ce072c84807bbd23a86ded2e3700a6e9944b77d8556cf84eaf"
+    },
+    {
+      "path": "src/robo_navigation/launch/navigation.launch.py",
+      "sha256": "e45cf573ef011a504bb26a0a32bc61f9cc23c1b5dae0b1062cb12222f9a184bf"
+    },
+    {
+      "path": "src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml",
+      "sha256": "f14cff11e5607df265fa2fb107ff6bab72cc7cc835ff842921dbe38228fa1476"
+    },
+    {
+      "path": "src/robo_navigation/scripts/alinhador_passagem.py",
+      "sha256": "05f7c7465b038b9f5633a5131611f950733be99c1ce2a83a77cd4bdc0da3ded4"
+    }
+  ],
+  "novos_codigo_rodada": [
+    {
+      "path": "src/robo_navigation/scripts/face_ws.py",
+      "sha256": "eac6b444a602556d71e71cbd4bbc14cb38b865eef161e4fda7ead59bf74be268"
+    },
+    {
+      "path": "src/robo_navigation/test/test_lateral_ws.py",
+      "sha256": "fdc7f4f71be7a3cda1e29458433b5308164c68e20795cae39a57ec97969e1854"
+    },
+    {
+      "path": "ferramentas/priorizar_lateral_ws.py",
+      "sha256": "bf6b44f4535ef9f59a560b6089159c03847c1bd6cf0a19973b548fadb2a5ab03"
+    },
+    {
+      "path": "ferramentas/reverter_prioridade_lateral_ws.py",
+      "sha256": "5fe0406fde4e6ecdaa9753fea8cad458f0ecbb710bbdde10fe1c2af73de7ebe2"
+    },
+    {
+      "path": "ferramentas/analise/revisao_ws_lateral.py",
+      "sha256": "cfa83d5e864550f5f2e92b3dbf7182075491fb3e5c4152e3cbef2b1b2c250822"
+    },
+    {
+      "path": "src/robo_navigation/launch/navigation.launch.py.antes_lateral_ws",
+      "sha256": "d7f1c7873c52782bcc2cec2dd534cb70fc64d9925e6f08238f4611cd8437384d"
+    },
+    {
+      "path": "src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml.antes_lateral_ws",
+      "sha256": "d17e1ab36cbc92945b0165c9f27eb46882a1d5f4269efe49eab640c09243f697"
+    }
+  ]
+}

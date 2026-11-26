@@ -3,7 +3,9 @@
 Collision Monitor permanece no pipeline. Nao usar junto de goal Nav2 ativo.
 """
 import argparse
+import os
 import select
+import subprocess
 import sys
 import termios
 import time
@@ -57,7 +59,7 @@ def main():
         tty.setcbreak(fd)
         print('GEOMETRY — TELEOP MANUAL W/S/A/D/Q/E')
         print('W frente | S re | A girar esquerda | D girar direita')
-        print('Q lateral esquerda | E lateral direita | ESPACO parar | X sair')
+        print('Q lateral esquerda | E lateral direita | T salvar mesa a frente como WS | ESPACO parar | X sair')
         print(f'Vx={a.linear:.3f} m/s Vy={a.lateral:.3f} m/s Wz={a.angular:.3f} rad/s')
         print(f'Publicacao: {a.topic} (TwistStamped). Collision Monitor permanece ativo.')
         print('IMPORTANTE: Sem objetivo autonomo ativo. Segure tecla (repeticao); soltar para em ate %.2fs.' % a.timeout)
@@ -70,6 +72,20 @@ def main():
                 if key == ' ':
                     velocity = (0., 0., 0.)
                     last_key = 0.
+                elif key == 't':   # TECLA_T (26/11): salva a mesa a frente como WS
+                    velocity = (0., 0., 0.)
+                    last_key = 0.
+                    for _ in range(3):
+                        publish(velocity)
+                        time.sleep(0.04)
+                    print('\nT: robo parado, medindo a mesa a frente (10 cm)...', flush=True)
+                    try:
+                        r = subprocess.run([sys.executable, os.path.expanduser(
+                            '~/robo_jazzy_ws/src/robo_navigation/scripts/marcar_mesa.py'), 'WS', '10'], timeout=30)
+                        print('T: WS salva.' if r.returncode == 0 else 'T: NADA salvo (veja o motivo acima).', flush=True)
+                    except subprocess.TimeoutExpired:
+                        print('T: NADA salvo (medicao passou de 30 s).', flush=True)
+                    termios.tcflush(fd, termios.TCIFLUSH)   # teclas apertadas durante a medicao nao andam
                 elif key in speeds:
                     velocity = speeds[key]
                     last_key = time.monotonic()

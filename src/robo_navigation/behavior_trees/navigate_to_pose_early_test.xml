@@ -1,0 +1,25 @@
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence>
+      <RateController hz="2.0">
+        <Fallback name="KeepFeasiblePath">
+          <ReactiveSequence>
+            <Inverter>
+              <GlobalUpdatedGoal />
+            </Inverter>
+            <Inverter>
+              <PathExpiringTimer seconds="15" path="{path}" />
+            </Inverter>
+            <TruncatePathLocal input_path="{smoothed_path}" output_path="{remaining_path}" distance_forward="1000000.0" distance_backward="0.0" robot_frame="base_link" transform_tolerance="0.3" />
+            <IsPathValid path="{remaining_path}" />
+          </ReactiveSequence>
+          <Sequence>
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}" />
+            <SmoothPath unsmoothed_path="{path}" smoothed_path="{smoothed_path}" smoother_id="simple_smoother" max_smoothing_duration="2.0" check_for_collisions="true" error_code_id="{smoothing_path_error_code}" />
+          </Sequence>
+        </Fallback>
+      </RateController>
+      <FollowPath path="{smoothed_path}" controller_id="FollowPath" error_code_id="{follow_path_error_code}" />
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

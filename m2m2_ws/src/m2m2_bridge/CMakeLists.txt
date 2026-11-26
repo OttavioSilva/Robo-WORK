@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.16)
+project(m2m2_bridge)
+find_package(ament_cmake REQUIRED)
+foreach(p std_msgs rclcpp sensor_msgs nav_msgs geometry_msgs std_srvs tf2 tf2_ros tf2_geometry_msgs)
+  find_package(${p} REQUIRED)
+endforeach()
+set(SLAMWARE_SDK "$ENV{HOME}/slamware_sdk/sdk_gcc9/slamware_sdk_linux-x86_64-gcc9/linux-x86_64-release" CACHE PATH "Slamware SDK")
+# SDK isolado em C++14 (usa throw() dinamico); boost do SDK so entra aqui
+add_library(m2m2_sdk STATIC src/m2m2_sdk.cpp)
+set_target_properties(m2m2_sdk PROPERTIES CXX_STANDARD 14 POSITION_INDEPENDENT_CODE ON)
+target_include_directories(m2m2_sdk SYSTEM BEFORE PRIVATE ${SLAMWARE_SDK}/include)
+target_link_directories(m2m2_sdk PUBLIC ${SLAMWARE_SDK}/lib)
+add_executable(m2m2_bridge src/m2m2_bridge.cpp)
+set_target_properties(m2m2_bridge PROPERTIES CXX_STANDARD 17)
+ament_target_dependencies(m2m2_bridge std_msgs rclcpp sensor_msgs nav_msgs geometry_msgs std_srvs tf2 tf2_ros tf2_geometry_msgs)
+target_link_libraries(m2m2_bridge m2m2_sdk -Wl,--start-group rpos_robotplatforms_rpslamware rpos_framework
+  boost_atomic boost_chrono boost_date_time boost_regex boost_system boost_thread boost_filesystem boost_random
+  base64 jsoncpp rlelib crypto curl ssl cares dl z rt m pthread -Wl,--end-group)
+install(TARGETS m2m2_bridge DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+ament_package()

@@ -17,7 +17,16 @@ command_imu_odometry:
 
     # Escalas registradas antes dos testes de centralizacao de 01/10.
     linear_scale_x: 5.0
-    linear_scale_y: 3.4
+    linear_scale_y: 6.0
+
+    # ODOM_TABELA (04/11): velocidade pela tabela medida, nao pela escala acima
+    # (escala so vale com velocity_model: escala). Medida com teste_velocidade_v2, PWM 150:
+    # distancia andada / 1,6 s, media de + e -. Trocou o PWM: medir de novo e trocar as listas.
+    velocity_model: tabela
+    speed_table_cmd: [0.0200, 0.0300, 0.0500, 0.0800, 0.1200, 0.1600, 0.2000, 0.3100]  # PWM_AJUSTE comando
+    speed_table_x: [0.1035, 0.1103, 0.1239, 0.1444, 0.1717, 0.1991, 0.2264, 0.3015]  # PWM_AJUSTE frente, ponte minimo 70 / max 0,31
+    speed_table_y: [0.0621, 0.0662, 0.0743, 0.0866, 0.1030, 0.1195, 0.1358, 0.1809]  # PWM_AJUSTE lado = 0,6 x frente
+    speed_deadband: 0.005
 
     # Covariancias deliberadamente conservadoras, pois nao ha encoders.
     position_variance: 0.25
