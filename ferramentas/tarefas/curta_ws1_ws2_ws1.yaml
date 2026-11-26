@@ -1,0 +1,14 @@
+# Missao curta (19/11 noite): START -> WS_1 -> WS_2 -> WS_1 -> FINISH (objetos so como ganchos, sem braco)
+task_id: curta_19_11
+name: curta WS_1 WS_2 WS_1
+duration_min: 20
+active_service_areas: [WS_1, WS_2]
+objects:
+  - {id: 1}
+  - {id: 2}
+start_state:
+  WS_1: {obj_ids: [1]}
+  WS_2: {obj_ids: [2]}
+finish_state:
+  WS_2: {obj_ids: [1]}
+  WS_1: {obj_ids: [2]}

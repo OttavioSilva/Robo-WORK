@@ -1,0 +1,1437 @@
+diff --git a/ferramentas/gravar_teste.sh b/ferramentas/gravar_teste.sh
+index d75c5b6..b5de18d 100755
+--- a/ferramentas/gravar_teste.sh
++++ b/ferramentas/gravar_teste.sh
+@@ -1,38 +1,6 @@
+-#!/bin/bash
+-# Uso: ~/gravar_teste.sh nome_do_teste "descrição opcional"
++#!/usr/bin/env bash
++# Compatibilidade: ~/gravar_teste.sh nome "descricao" [--duration segundos]
++set -e
+ source /opt/ros/jazzy/setup.bash
+-source ~/robo_jazzy_ws/install/setup.bash
+-NOME=${1:-teste}
+-DESC=${2:-}
+-PASTA=~/bags/${NOME}_$(date +%Y%m%d_%H%M%S)
+-mkdir -p "$PASTA/ros_logs"
+-{ echo "teste: $NOME"; echo "descricao: $DESC"; echo "inicio: $(date '+%F %T')"; } > "$PASTA/notas.txt"
+-
+-echo ">>> Salvando os parâmetros em uso..."
+-for n in controller_server planner_server bt_navigator behavior_server smoother_server velocity_smoother collision_monitor slam_toolbox local_costmap/local_costmap global_costmap/global_costmap; do
+-  f="$PASTA/params_$(echo $n | tr '/' '_').yaml"
+-  if timeout 15 ros2 param dump /$n > "$f" 2>/dev/null && [ -s "$f" ]; then echo "   ok: $n"; else rm -f "$f"; echo "   não ativo: $n"; fi
+-done
+-
+-TOPICOS=(
+-  /rosout /tf /tf_static /scan_front /scan_raw /odom /imu/data /map /diagnostics
+-  /plan /plan_smoothed /local_plan /transformed_global_plan /evaluation
+-  /cmd_vel_nav /cmd_vel_smoothed /cmd_vel /collision_monitor_state
+-  /local_costmap/costmap /local_costmap/costmap_updates /local_costmap/published_footprint
+-  /global_costmap/costmap /global_costmap/costmap_updates
+-  /goal_pose /clicked_point /behavior_tree_log
+-  /navigate_to_pose/_action/status /navigate_to_pose/_action/feedback
+-  /follow_path/_action/status /compute_path_to_pose/_action/status
+-  /spin/_action/status /backup/_action/status
+-)
+-
+-trap ':' INT
+-echo ">>> GRAVANDO em $PASTA/bag  —  aperte Ctrl+C para parar."
+-ros2 bag record --include-hidden-topics --compression-mode file --compression-format zstd \
+-  -o "$PASTA/bag" "${TOPICOS[@]}"
+-
+-echo "fim: $(date '+%F %T')" >> "$PASTA/notas.txt"
+-cp -r /dev/shm/robo_ros_logs_* "$PASTA/ros_logs/" 2>/dev/null
+-tar -czf "$PASTA.tar.gz" -C ~/bags "$(basename "$PASTA")"
+-echo ">>> Teste salvo em: $PASTA"
+-echo ">>> Arquivo único para enviar: $PASTA.tar.gz ($(du -h "$PASTA.tar.gz" | cut -f1))"
++source "$HOME/robo_jazzy_ws/install/setup.bash"
++exec python3 "$HOME/robo_jazzy_ws/ferramentas/gravar_teste.py" "$@"
+diff --git a/src/robo_hardware/CMakeLists.txt b/src/robo_hardware/CMakeLists.txt
+index 9836fbd..28142b6 100644
+--- a/src/robo_hardware/CMakeLists.txt
++++ b/src/robo_hardware/CMakeLists.txt
+@@ -15,6 +15,7 @@ find_package(std_msgs REQUIRED)
+ 
+ add_executable(hardware_bridge_node src/hardware_bridge_node.cpp)
+ target_compile_features(hardware_bridge_node PUBLIC cxx_std_17)
++target_include_directories(hardware_bridge_node PRIVATE include)
+ ament_target_dependencies(hardware_bridge_node
+   diagnostic_msgs
+   geometry_msgs
+@@ -32,4 +33,12 @@ install(DIRECTORY config launch
+   DESTINATION share/${PROJECT_NAME}
+ )
+ 
++if(BUILD_TESTING)
++  enable_testing()
++  add_executable(test_sensor_clock test/test_sensor_clock.cpp)
++  target_include_directories(test_sensor_clock PRIVATE include)
++  target_compile_features(test_sensor_clock PRIVATE cxx_std_17)
++  add_test(NAME sensor_clock COMMAND test_sensor_clock)
++endif()
++
+ ament_package()
+diff --git a/src/robo_hardware/launch/hardware.launch.py b/src/robo_hardware/launch/hardware.launch.py
+index 8f3fc17..9f502a6 100644
+--- a/src/robo_hardware/launch/hardware.launch.py
++++ b/src/robo_hardware/launch/hardware.launch.py
+@@ -2,6 +2,9 @@ from pathlib import Path
+ 
+ from ament_index_python.packages import get_package_share_directory
+ from launch import LaunchDescription
++from launch.actions import DeclareLaunchArgument
++from launch.substitutions import LaunchConfiguration
++from launch_ros.parameter_descriptions import ParameterValue
+ from launch_ros.actions import Node
+ 
+ 
+@@ -11,12 +14,24 @@ def generate_launch_description():
+ 
+     return LaunchDescription(
+         [
++            DeclareLaunchArgument('temporal_enabled', default_value='false'),
++            DeclareLaunchArgument('command_authority', default_value=''),
++            DeclareLaunchArgument('heading_hold_enabled', default_value='true'),
++            DeclareLaunchArgument('device_clock_drift_bound_ppm', default_value='-1.0'),
++            DeclareLaunchArgument('lidar_capture_lag_bound_s', default_value='-1.0'),
++            DeclareLaunchArgument('imu_capture_lag_bound_s', default_value='-1.0'),
+             Node(
+                 package="robo_hardware",
+                 executable="hardware_bridge_node",
+                 name="robo_hardware",
+                 output="screen",
+-                parameters=[str(parameters)],
++                parameters=[str(parameters), {
++                    'temporal_enabled': ParameterValue(LaunchConfiguration('temporal_enabled'), value_type=bool),
++                    'command_authority': ParameterValue(LaunchConfiguration('command_authority'), value_type=str),
++                    'heading_hold_enabled': ParameterValue(LaunchConfiguration('heading_hold_enabled'), value_type=bool),
++                    **{k: ParameterValue(LaunchConfiguration(k), value_type=float) for k in
++                       ('device_clock_drift_bound_ppm', 'lidar_capture_lag_bound_s', 'imu_capture_lag_bound_s')}
++                }],
+             )
+         ]
+     )
+diff --git a/src/robo_hardware/src/hardware_bridge_node.cpp b/src/robo_hardware/src/hardware_bridge_node.cpp
+index e0ebc69..9f3ef17 100644
+--- a/src/robo_hardware/src/hardware_bridge_node.cpp
++++ b/src/robo_hardware/src/hardware_bridge_node.cpp
+@@ -7,6 +7,8 @@
+ #include <cstring>
+ #include <fcntl.h>
+ #include <limits>
++#include <sstream>
++#include "robo_hardware/sensor_clock.hpp"
+ #include <poll.h>
+ #include <stdexcept>
+ #include <string>
+@@ -25,6 +27,8 @@
+ #include "sensor_msgs/msg/laser_scan.hpp"
+ #include "std_msgs/msg/bool.hpp"
+ #include "std_msgs/msg/float64.hpp"
++#include "std_msgs/msg/string.hpp"
++#include "std_msgs/msg/u_int8_multi_array.hpp"
+ 
+ namespace
+ {
+@@ -184,6 +188,24 @@ public:
+     heading_hold_imu_timeout_s_ = declare_parameter<double>(
+       "heading_hold_imu_timeout_s", 0.20);
+ 
++    command_authority_ = declare_parameter<std::string>("command_authority", "");
++    temporal_enabled_ = declare_parameter<bool>("temporal_enabled", false);
++    clock_drift_ppm_ = declare_parameter<double>("device_clock_drift_bound_ppm", -1.0);
++    lidar_capture_lag_ = declare_parameter<double>("lidar_capture_lag_bound_s", -1.0);
++    imu_capture_lag_ = declare_parameter<double>("imu_capture_lag_bound_s", -1.0);
++    if (!std::isfinite(clock_drift_ppm_) || !std::isfinite(lidar_capture_lag_) || !std::isfinite(imu_capture_lag_)) {
++      throw std::invalid_argument("temporal bounds must be finite; -1 means unknown");
++    }
++    scan_temporal_publisher_ = create_publisher<sensor_msgs::msg::LaserScan>(
++      "scan_raw_temporal", rclcpp::SensorDataQoS());
++    imu_temporal_publisher_ = create_publisher<sensor_msgs::msg::Imu>(
++      "imu/data_temporal", rclcpp::SensorDataQoS());
++    timing_publisher_ = create_publisher<std_msgs::msg::String>("hardware/sensor_timing", 20);
++    tx_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/tx_frames", 20);
++    rx_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/serial_rx", 20);
++    lidar_packet_publisher_ = create_publisher<std_msgs::msg::UInt8MultiArray>("hardware/lidar_packets", 100);
++    effective_publisher_ = create_publisher<geometry_msgs::msg::TwistStamped>("cmd_vel_hardware", 20);
++    probe_timer_ = create_wall_timer(200ms, [this]() { send_clock_probe(); });
+     validate_parameters();
+ 
+     parameter_callback_handle_ = add_on_set_parameters_callback(
+@@ -202,7 +224,18 @@ public:
+ 
+     command_subscription_ = create_subscription<geometry_msgs::msg::TwistStamped>(
+       "cmd_vel", rclcpp::QoS(10).reliable(),
+-      [this](const geometry_msgs::msg::TwistStamped::SharedPtr message) {
++      [this](const geometry_msgs::msg::TwistStamped::SharedPtr message, const rclcpp::MessageInfo &info) {
++        if (!command_authority_.empty()) {
++          const auto publishers = get_publishers_info_by_topic("/cmd_vel");
++          const auto &gid = info.get_rmw_message_info().publisher_gid;
++          if (publishers.size() != 1 || publishers[0].node_name() != command_authority_ ||
++              !std::equal(publishers[0].endpoint_gid().begin(), publishers[0].endpoint_gid().end(), gid.data)) {
++            have_velocity_command_ = false;
++            reset_heading_hold();
++            queue_motor_command({0, 0, 0, 0}, 0);
++            return;
++          }
++        }
+         receive_command(*message);
+       });
+ 
+@@ -350,6 +383,11 @@ private:
+     try {
+       for (const auto & parameter : parameters) {
+         const std::string & name = parameter.get_name();
++        if (name == "command_authority" || name == "temporal_enabled" || name == "device_clock_drift_bound_ppm" ||
++          name == "lidar_capture_lag_bound_s" || name == "imu_capture_lag_bound_s") {
++          result.reason = "temporal protocol settings require process restart";
++          return result;
++        }
+         if (name == "heading_hold_enabled") {
+           enabled = parameter.as_bool();
+         } else if (name == "heading_hold_kp") {
+@@ -420,10 +458,22 @@ private:
+     if (!std::isfinite(linear_x) || !std::isfinite(linear_y) ||
+       !std::isfinite(angular_z))
+     {
+-      RCLCPP_WARN(get_logger(), "Ignoring non-finite velocity command");
++      have_velocity_command_ = false;
++      reset_heading_hold();
++      queue_motor_command({0, 0, 0, 0}, 0);
++      RCLCPP_WARN(get_logger(), "Stopping on non-finite velocity command");
+       return;
+     }
+ 
++    const int64_t source_ns = (message.header.stamp.sec >= 0 && message.header.stamp.nanosec < 1000000000U)
++      ? rclcpp::Time(message.header.stamp).nanoseconds() : 0;
++    if (!robo_hardware::valid_command_stamp(source_ns, now().nanoseconds(), command_timeout_s_)) {
++      have_velocity_command_ = false;
++      reset_heading_hold();
++      queue_motor_command({0, 0, 0, 0}, 0);
++      RCLCPP_WARN(get_logger(), "Velocity command source timestamp invalid/stale");
++      return;
++    }
+     commanded_vx_mps_ = linear_x;
+     commanded_vy_mps_ = linear_y;
+     commanded_wz_rps_ = angular_z;
+@@ -483,6 +533,8 @@ private:
+     serial_command_ready_time_ = steady_clock_.now() +
+       rclcpp::Duration::from_seconds(serial_startup_delay_s_);
+     reset_rx_parser();
++    sensor_clock_.reset();
++    probe_pending_ = false;
+     pending_tx_frame_.clear();
+     pending_tx_offset_ = 0;
+     RCLCPP_INFO(
+@@ -498,6 +550,8 @@ private:
+       serial_fd_ = -1;
+     }
+     reset_rx_parser();
++    sensor_clock_.reset();
++    probe_pending_ = false;
+     pending_tx_frame_.clear();
+     pending_tx_offset_ = 0;
+     have_latest_imu_ = false;
+@@ -567,6 +621,9 @@ private:
+             get_logger(), "First serial RX after %.3f s (%zd bytes)",
+             (steady_clock_.now() - serial_open_time_).seconds(), count);
+         }
++        std_msgs::msg::UInt8MultiArray raw;
++        raw.data.assign(read_buffer.begin(), read_buffer.begin()+count);
++        rx_publisher_->publish(raw);
+         host_rx_bytes_ += static_cast<uint64_t>(count);
+         ++host_rx_reads_;
+         for (ssize_t i = 0; i < count; ++i) {
+@@ -648,7 +705,20 @@ private:
+ 
+     const uint8_t type = rx_frame_[1];
+     const uint8_t * payload = rx_frame_.data() + 4;
+-    if (type == kTypeScan && payload_size == kScanPayloadSize) {
++    if (type == 0x16 && payload_size >= 15U && payload_size <= 164U) {
++      std_msgs::msg::UInt8MultiArray packet;
++      packet.data.assign(payload, payload+payload_size);
++      lidar_packet_publisher_->publish(packet);
++    } else if (type == 0x14 && payload_size == 8U && probe_pending_) {
++      if (read_u32_le(payload) == probe_token_) {
++        sensor_clock_.anchor(probe_sent_, steady_clock_.now().seconds(), read_u32_le(payload+4));
++        probe_pending_ = false;
++      }
++    } else if (type == 0x13 && payload_size == kScanPayloadSize+16U) {
++      publish_scan(payload, true);
++    } else if (type == 0x15 && payload_size == kImuPayloadSize+12U) {
++      publish_imu(payload, true);
++    } else if (type == kTypeScan && payload_size == kScanPayloadSize) {
+       publish_scan(payload);
+     } else if (type == kTypeStatus && payload_size == kStatusPayloadSize) {
+       publish_status(payload);
+@@ -659,7 +729,72 @@ private:
+     }
+   }
+ 
+-  void publish_scan(const uint8_t * payload)
++  void send_clock_probe()
++  {
++    if (!temporal_enabled_ || serial_fd_ < 0 || !pending_tx_frame_.empty() ||
++      steady_clock_.now() < serial_command_ready_time_) return;
++    if (probe_pending_ && steady_clock_.now().seconds()-probe_sent_ < 0.5) return;
++    // Probe nunca interrompe quadro de motor. Espera de fila entra no RTT medido.
++    probe_pending_ = true;
++    probe_sent_ = steady_clock_.now().seconds();
++    ++probe_token_;
++    std::vector<uint8_t> frame{kSof1, kSof2, kProtocolVersion, 0x02};
++    append_u16_le(frame, 4U);
++    frame.push_back(probe_token_ & 0xff);
++    frame.push_back((probe_token_ >> 8) & 0xff);
++    frame.push_back((probe_token_ >> 16) & 0xff);
++    frame.push_back((probe_token_ >> 24) & 0xff);
++    append_u16_le(frame, crc16_ccitt(frame.data()+2, frame.size()-2));
++    pending_tx_frame_ = std::move(frame);
++    pending_tx_offset_ = 0;
++    flush_serial_tx();
++  }
++
++  int64_t temporal_stamp(const char * sensor, const uint8_t * payload,
++    std::size_t offset, double lag, const builtin_interfaces::msg::Time &publication)
++  {
++    double age = 0, uncertainty = 0;
++    uint32_t begin = 0, end = 0, queued = 0;
++    if (offset) {
++      begin = read_u32_le(payload+offset);
++      end = read_u32_le(payload+offset+4);
++      queued = read_u32_le(payload+offset+8);
++    }
++    bool valid = temporal_enabled_ && offset && sensor_clock_.oldest(
++      steady_clock_.now().seconds(), begin, end, queued, clock_drift_ppm_, lag, age, uncertainty);
++    int64_t stamp_ns = 0;
++    if (valid) stamp_ns = rclcpp::Time(publication).nanoseconds()-static_cast<int64_t>(age*1e9);
++    if (stamp_ns <= 0) valid = false;
++    const uint32_t geometry = offset == kScanPayloadSize ? read_u32_le(payload+offset+12) : 0;
++    if (offset == kScanPayloadSize && (geometry & 0xffU) != 2U) valid = false;
++    const char * reason = valid ? "ok" : (!temporal_enabled_ ? "disabled" :
++      (!offset ? "legacy_frame" : (clock_drift_ppm_ < 0 || lag < 0 ? "unknown_capture_or_clock_bound" :
++        (!sensor_clock_.anchored ? "clock_unsynchronized" : "stale_or_inconsistent_window"))));
++    std::ostringstream json;
++    json.precision(17);
++    json << "{\"schema\":1,\"sensor\":\"" << sensor << "\",\"valid\":"
++      << (valid ? "true" : "false") << ",\"reason\":\"" << reason << "\",\"timed_frame\":" << (offset ? "true" : "false")
++      << ",\"capture_begin_us\":" << begin << ",\"capture_end_us\":" << end
++      << ",\"queued_us\":" << queued << ",\"age_upper_s\":" << age
++      << ",\"uncertainty_s\":" << uncertainty << ",\"stamp_ns\":" << stamp_ns
++      << ",\"publication_stamp_ns\":" << rclcpp::Time(publication).nanoseconds()
++      << ",\"probe_host_sent_s\":" << sensor_clock_.sent
++      << ",\"probe_host_received_s\":" << sensor_clock_.received
++      << ",\"probe_device_us\":" << sensor_clock_.device
++      << ",\"drift_bound_ppm\":" << clock_drift_ppm_
++      << ",\"capture_lag_bound_s\":" << lag
++      << ",\"scan_capture_schema\":" << (geometry & 0xffU)
++      << ",\"samples_per_packet_min\":" << ((geometry >> 8) & 0xffU)
++      << ",\"samples_per_packet_max\":" << ((geometry >> 16) & 0xffU)
++      << ",\"packets_in_scan\":" << ((geometry >> 24) & 0xffU)
++      << ",\"capture_kind\":\"mcu_receive_or_i2c_window\"}";
++    std_msgs::msg::String msg;
++    msg.data = json.str();
++    timing_publisher_->publish(msg);
++    return valid ? stamp_ns : 0;
++  }
++
++  void publish_scan(const uint8_t * payload, bool timed = false)
+   {
+     const uint32_t scan_time_us = read_u32_le(payload + 6);
+     const uint8_t frequency_x20 = payload[10];
+@@ -694,7 +829,15 @@ private:
+       }
+     }
+ 
+-    scan_publisher_->publish(message);
++    if (!timed) scan_publisher_->publish(message);
++    auto stamp = temporal_stamp("lidar", payload, timed ? kScanPayloadSize : 0U,
++      lidar_capture_lag_, message.header.stamp);
++    if (stamp > 0) {
++      message.header.stamp = rclcpp::Time(stamp);
++      // Bins agregados/invertidos nao possuem ordem temporal conhecida por raio.
++      message.time_increment = 0.0F;
++      scan_temporal_publisher_->publish(message);
++    }
+     ++published_scans_;
+   }
+ 
+@@ -738,7 +881,7 @@ private:
+     publish_diagnostics(status);
+   }
+ 
+-  void publish_imu(const uint8_t * payload)
++  void publish_imu(const uint8_t * payload, bool timed = false)
+   {
+     const int32_t heading_mdeg = read_i32_le(payload + 6);
+     const int16_t gyro_z_mrad_s = read_i16_le(payload + 10);
+@@ -779,6 +922,12 @@ private:
+     message.angular_velocity_covariance[8] = 0.02;
+     message.linear_acceleration_covariance[0] = -1.0;
+     imu_publisher_->publish(message);
++    auto stamp = temporal_stamp("imu", payload, timed ? kImuPayloadSize : 0U,
++      imu_capture_lag_, message.header.stamp);
++    if (stamp > 0) {
++      message.header.stamp = rclcpp::Time(stamp);
++      imu_temporal_publisher_->publish(message);
++    }
+ 
+     std_msgs::msg::Float64 yaw_message;
+     yaw_message.data = yaw_rad * 180.0 / kPi;
+@@ -1070,6 +1219,12 @@ private:
+ 
+   void queue_motor_command(const std::array<int16_t, 4> & pwm, uint8_t flags)
+   {
++    if ((flags & kFlagEnable) == 0 || std::all_of(pwm.begin(), pwm.end(), [](int16_t v) {return v == 0;})) {
++      geometry_msgs::msg::TwistStamped zero;
++      zero.header.stamp = now();
++      zero.header.frame_id = "base_link";
++      effective_publisher_->publish(zero);
++    }
+     if (serial_fd_ < 0 || steady_clock_.now() < serial_command_ready_time_) {
+       return;
+     }
+@@ -1094,6 +1249,9 @@ private:
+       host_tx_bytes_ += static_cast<uint64_t>(written);
+       pending_tx_offset_ += static_cast<std::size_t>(written);
+       if (pending_tx_offset_ == pending_tx_frame_.size()) {
++        std_msgs::msg::UInt8MultiArray bytes;
++        bytes.data = pending_tx_frame_;
++        tx_publisher_->publish(bytes);
+         pending_tx_frame_.clear();
+         pending_tx_offset_ = 0;
+       }
+@@ -1123,7 +1281,15 @@ private:
+       return;
+     }
+ 
+-    queue_motor_command(calculate_motor_pwm(controlled_angular_velocity()), kFlagEnable);
++    const double effective_wz = controlled_angular_velocity();
++    geometry_msgs::msg::TwistStamped effective;
++    effective.header.stamp = now();
++    effective.header.frame_id = "base_link";
++    effective.twist.linear.x = commanded_vx_mps_;
++    effective.twist.linear.y = commanded_vy_mps_;
++    effective.twist.angular.z = effective_wz;
++    effective_publisher_->publish(effective);
++    queue_motor_command(calculate_motor_pwm(effective_wz), kFlagEnable);
+   }
+ 
+   void send_emergency_stop_best_effort()
+@@ -1208,6 +1374,19 @@ private:
+     }
+   }
+ 
++  std::string command_authority_;
++  bool temporal_enabled_{false}, probe_pending_{false};
++  uint32_t probe_token_{0};
++  double probe_sent_{0}, clock_drift_ppm_{-1}, lidar_capture_lag_{-1}, imu_capture_lag_{-1};
++  robo_hardware::SensorClock sensor_clock_;
++  rclcpp::TimerBase::SharedPtr probe_timer_;
++  rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_temporal_publisher_;
++  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_temporal_publisher_;
++  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr timing_publisher_;
++  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr tx_publisher_;
++  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr rx_publisher_;
++  rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr lidar_packet_publisher_;
++  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr effective_publisher_;
+   std::string serial_port_;
+   int serial_baud_{500000};
+   double serial_startup_delay_s_{5.0};
+diff --git a/src/robo_lidar/launch/lidar_filter.launch.py b/src/robo_lidar/launch/lidar_filter.launch.py
+index d11ebd2..9e36343 100644
+--- a/src/robo_lidar/launch/lidar_filter.launch.py
++++ b/src/robo_lidar/launch/lidar_filter.launch.py
+@@ -1,4 +1,5 @@
+ from pathlib import Path
++import yaml
+ 
+ from ament_index_python.packages import get_package_share_directory
+ from launch import LaunchDescription
+@@ -11,6 +12,11 @@ def generate_launch_description():
+     package_share = Path(get_package_share_directory("robo_lidar"))
+     parameters = package_share / "config" / "lidar.yaml"
+ 
++    with open(parameters) as fp:
++        temporal_parameters = yaml.safe_load(fp)['scan_filter']['ros__parameters']
++    temporal_parameters = dict(temporal_parameters, input_topic='/scan_raw_temporal',
++                               output_topic='/scan_temporal_front')
++
+     lidar_x = LaunchConfiguration("lidar_x")
+     lidar_y = LaunchConfiguration("lidar_y")
+     lidar_z = LaunchConfiguration("lidar_z")
+@@ -54,6 +60,8 @@ def generate_launch_description():
+                     "--child-frame-id", "laser_raw",
+                 ],
+             ),
++            Node(package='robo_lidar', executable='scan_filter_node',
++                 name='scan_filter_temporal', output='screen', parameters=[temporal_parameters]),
+             Node(
+                 package="robo_lidar",
+                 executable="scan_filter_node",
+diff --git a/src/robo_lidar/package.xml b/src/robo_lidar/package.xml
+index e76d5dd..4e772ed 100644
+--- a/src/robo_lidar/package.xml
++++ b/src/robo_lidar/package.xml
+@@ -13,6 +13,7 @@
+   <exec_depend>launch</exec_depend>
+   <exec_depend>launch_ros</exec_depend>
+   <exec_depend>rclpy</exec_depend>
++  <exec_depend>python3-yaml</exec_depend>
+   <exec_depend>sensor_msgs</exec_depend>
+   <exec_depend>tf2_ros</exec_depend>
+ 
+diff --git a/src/robo_navigation/CMakeLists.txt b/src/robo_navigation/CMakeLists.txt
+index 3c0f4d3..c09e1a1 100644
+--- a/src/robo_navigation/CMakeLists.txt
++++ b/src/robo_navigation/CMakeLists.txt
+@@ -8,4 +8,11 @@ install(
+   DESTINATION share/${PROJECT_NAME}
+ )
+ 
++if(BUILD_TESTING)
++  find_package(ament_cmake_pytest REQUIRED)
++  ament_add_pytest_test(lateral_ws test/test_lateral_ws.py)
++  ament_add_pytest_test(giro_frontal test/test_giro_frontal.py)
++  ament_add_pytest_test(giro_integrado test/test_integrado_t.py TIMEOUT 120)
++endif()
++
+ ament_package()
+diff --git a/src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml b/src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml
+index 306add4..fbb207d 100644
+--- a/src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml
++++ b/src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml
+@@ -24,7 +24,8 @@
+                 <Inverter>
+                   <PathExpiringTimer seconds="15" path="{path}"/>
+                 </Inverter>
+-                <IsPathValid path="{path}"/>
++                <!-- PRIORIDADE_LATERAL_WS_20261109: verificar o caminho executado pelo FollowPath. -->
++                <IsPathValid path="{smoothed_path}"/>
+               </ReactiveSequence>
+               <Sequence name="ComputeAndSmoothPath">
+               <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" />
+diff --git a/src/robo_navigation/config/nav2_params.yaml b/src/robo_navigation/config/nav2_params.yaml
+index 2265ab1..bbdd950 100644
+--- a/src/robo_navigation/config/nav2_params.yaml
++++ b/src/robo_navigation/config/nav2_params.yaml
+@@ -328,6 +328,7 @@ collision_monitor:
+ 
+     polygons:
+     - VelocityPolygonStop
++    - SweptTurnStop
+ 
+     VelocityPolygonStop:
+       type: velocity_polygon
+@@ -433,6 +434,42 @@ collision_monitor:
+         theta_min: -0.60
+         theta_max: -0.20
+ 
++    # Envelope circunscrito (nao inscrito) aos cantos + 5 cm.
++    # Ativado pelo launch SOMENTE no modo experimental. Inclui giros combinados.
++    SweptTurnStop:
++      type: velocity_polygon
++      action_type: stop
++      min_points: 1
++      visualize: true
++      polygon_pub_topic: collision_monitor_swept_turn
++      enabled: false
++      holonomic: true
++      velocity_polygons: [left_turn, right_turn, quiet]
++      left_turn:
++        points: "[[0.532131, 0.105847], [0.451119, 0.301428], [0.301428, 0.451119], [0.105847, 0.532131], [-0.105847, 0.532131], [-0.301428, 0.451119], [-0.451119, 0.301428], [-0.532131, 0.105847], [-0.532131, -0.105847], [-0.451119, -0.301428], [-0.301428, -0.451119], [-0.105847, -0.532131], [0.105847, -0.532131], [0.301428, -0.451119], [0.451119, -0.301428], [0.532131, -0.105847]]"
++        linear_min: 0.0
++        linear_max: 0.35
++        direction_start_angle: -3.141592653589793
++        direction_end_angle: 3.141592653589793
++        theta_min: 0.015
++        theta_max: 0.6
++      right_turn:
++        points: "[[0.532131, 0.105847], [0.451119, 0.301428], [0.301428, 0.451119], [0.105847, 0.532131], [-0.105847, 0.532131], [-0.301428, 0.451119], [-0.451119, 0.301428], [-0.532131, 0.105847], [-0.532131, -0.105847], [-0.451119, -0.301428], [-0.301428, -0.451119], [-0.105847, -0.532131], [0.105847, -0.532131], [0.301428, -0.451119], [0.451119, -0.301428], [0.532131, -0.105847]]"
++        linear_min: 0.0
++        linear_max: 0.35
++        direction_start_angle: -3.141592653589793
++        direction_end_angle: 3.141592653589793
++        theta_min: -0.6
++        theta_max: -0.015
++      quiet:
++        points: "[[0.375, 0.325], [0.375, -0.325], [-0.215, -0.325], [-0.215, 0.325]]"
++        linear_min: 0.0
++        linear_max: 0.35
++        direction_start_angle: -3.141592653589793
++        direction_end_angle: 3.141592653589793
++        theta_min: -0.6
++        theta_max: 0.6
++
+     observation_sources:
+     - scan
+     scan:
+diff --git a/src/robo_navigation/launch/navigation.launch.py b/src/robo_navigation/launch/navigation.launch.py
+index d1bda3a..601a4c1 100644
+--- a/src/robo_navigation/launch/navigation.launch.py
++++ b/src/robo_navigation/launch/navigation.launch.py
+@@ -6,7 +6,8 @@ from ament_index_python.packages import get_package_share_directory
+ from launch import LaunchDescription
+ from launch.actions import DeclareLaunchArgument, RegisterEventHandler, TimerAction, ExecuteProcess
+ from launch.event_handlers import OnProcessStart
+-from launch.substitutions import LaunchConfiguration
++from launch.substitutions import LaunchConfiguration, PythonExpression
++from launch_ros.parameter_descriptions import ParameterValue
+ from launch_ros.actions import Node
+ 
+ 
+@@ -14,6 +15,7 @@ def generate_launch_description():
+     use_sim_time = LaunchConfiguration("use_sim_time")
+     autostart = LaunchConfiguration("autostart")
+     params_file = LaunchConfiguration("params_file")
++    modo_curva_t = LaunchConfiguration("modo_curva_t")
+ 
+     navigation_share = get_package_share_directory("robo_navigation")
+     default_params_file = os.path.join(
+@@ -93,6 +95,10 @@ def generate_launch_description():
+ 
+     return LaunchDescription(
+         [
++            DeclareLaunchArgument("limite_vel_angular_real_t", default_value="-1.0"),
++            DeclareLaunchArgument("limite_vel_linear_real_t", default_value="-1.0"),
++            DeclareLaunchArgument("modo_curva_t", default_value="lateral",
++                                  choices=["lateral"]),
+             DeclareLaunchArgument(
+                 "use_sim_time",
+                 default_value="false",
+@@ -167,7 +173,7 @@ def generate_launch_description():
+                 name="velocity_smoother",
+                 output="screen",
+                 parameters=common_parameters,
+-                # Entrada: /cmd_vel_nav; saida preservada em /cmd_vel_smoothed.
++                # PRIORIDADE_LATERAL_WS_20261109: caminho lateral original; giro suspenso.
+                 remappings=common_remappings + [("cmd_vel", "cmd_vel_nav")],
+             ),
+             Node(
+@@ -175,7 +181,11 @@ def generate_launch_description():
+                 executable="collision_monitor",
+                 name="collision_monitor",
+                 output="screen",
+-                parameters=common_parameters,
++                parameters=common_parameters + [{
++                    "stop_pub_timeout": ParameterValue(PythonExpression([
++                        "86400.0 if '", modo_curva_t, "' == 'giro_frontal' else 2.0"]), value_type=float),
++                    "SweptTurnStop.enabled": ParameterValue(
++                        PythonExpression(["'", modo_curva_t, "' == 'giro_frontal'"]), value_type=bool)}],
+                 # Parametros fazem /cmd_vel_smoothed -> /cmd_vel.
+                 remappings=common_remappings,
+             ),
+@@ -191,7 +201,10 @@ def generate_launch_description():
+             ),
+             ExecuteProcess(  # NAV_TUDO: alinhador: passagens, mesas, START/FINISH
+                 cmd=["python3", os.path.expanduser(
+-                    "~/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py")],
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py"),
++                     "--ros-args", "-p", ["modo_curva_t:=", modo_curva_t],
++                     "-p", ["limite_vel_angular_real_t:=", LaunchConfiguration("limite_vel_angular_real_t")],
++                     "-p", ["limite_vel_linear_real_t:=", LaunchConfiguration("limite_vel_linear_real_t")]],
+                 output="screen",
+             ),
+             ExecuteProcess(  # SUAVIZADOR_NAV: /cmd_vel_ctrl -> /cmd_vel_nav
+diff --git a/src/robo_navigation/package.xml b/src/robo_navigation/package.xml
+index ca6d94d..b6a8bbd 100644
+--- a/src/robo_navigation/package.xml
++++ b/src/robo_navigation/package.xml
+@@ -27,8 +27,16 @@
+   <exec_depend>nav2_velocity_smoother</exec_depend>
+   <exec_depend>nav2_collision_monitor</exec_depend>
+ 
++  <test_depend>ament_cmake_pytest</test_depend>
++
+   <export>
+     <build_type>ament_cmake</build_type>
+   </export>
+   <exec_depend>robo_recovery</exec_depend>
++  <exec_depend>std_srvs</exec_depend>
++  <exec_depend>std_msgs</exec_depend>
++  <exec_depend>geometry_msgs</exec_depend>
++  <exec_depend>rcl_interfaces</exec_depend>
++  <exec_depend>lifecycle_msgs</exec_depend>
++  <exec_depend>python3-yaml</exec_depend>
+ </package>
+diff --git a/src/robo_navigation/scripts/alinhador_passagem.py b/src/robo_navigation/scripts/alinhador_passagem.py
+index eec1c78..3555248 100644
+--- a/src/robo_navigation/scripts/alinhador_passagem.py
++++ b/src/robo_navigation/scripts/alinhador_passagem.py
+@@ -182,12 +182,16 @@ Uso:
+     python3 alinhador_passagem.py
+     python3 alinhador_passagem.py --ros-args -p modo_travessia:=nav2   (comportamento v2)
+ """
++from face_ws import selecionar_face, RastreioFaceWS, pose_mapa_no_scan, obstaculo_antes_da_face
++import json
+ import collections
+ import heapq  # ROTA_MAPA
+ import math
+ import os
+ import threading
+ import time
++from giro_frontal import (GiroFrontal, TempoSensor, Observacao, avaliar_varredura,
++                          devolver_controle, envolve_disco)
+ 
+ # ---------------------------------------------------------------------------
+ # Nucleo geometrico (sem ROS: pode ser testado fora do robo)
+@@ -1452,6 +1456,9 @@ class TravessiaLateral:
+             if novo is None or velho is None or velho < novo + 0.03:
+                 return novo
+             return velho
++        if any(v is not None and v < 0 for v in (frente, tras)):
++            self.abortar('folga negativa medida no corpo')
++            return
+         ult = self._folga_crua
+         self._folga_crua = (frente, tras)
+         if ult is not None:
+@@ -1593,13 +1600,7 @@ class TravessiaLateral:
+         self._mudar('assentar', t, pose)
+ 
+     def abortar(self, motivo):
+-        # v3.18: com o corpo inteiro ja fora do corredor (>= 35 cm alem da saida, meia
+-        # largura 31,5 cm) o problema nao e mais do corredor: da a saida por concluida e o
+-        # Nav2 segue dali
+-        if self.restante <= self.restante_fora:
+-            self.estado = 'fim'
+-            self.log('Saida lateral concluida (corpo ja fora do corredor; parei por: %s)' % motivo)
+-            return
++        # Falha nao e prova de saida: sucesso so pelo criterio normal de passo().
+         self.estado, self.motivo = 'abortar', motivo
+         self.log('Saida lateral abortada: %s' % motivo)
+ 
+@@ -1614,6 +1615,8 @@ class TravessiaLateral:
+ 
+     def passo(self, t, pose, restante):
+         """Devolve (vx, vy, wz). restante: metros (no eixo do corredor novo) ate sair dele."""
++        if self.estado in ('fim', 'abortar'):
++            return 0.0, 0.0, 0.0
+         if self.t0 is None:
+             self.t0 = t
+             self.p_inicio = pose
+@@ -1827,62 +1830,9 @@ class TravessiaLateral:
+ # ---------------------------------------------------------------------------
+ # Encostar de frente numa Service Area pelo LiDAR (sem ROS)
+ # ---------------------------------------------------------------------------
+-def medir_face(pts, x_min=0.30, x_max=1.30, y_lim=0.70, tol=0.02):
+-    """Face da mesa a frente do robo (pontos em base_link).
+-
+-    Devolve dict(dist, ang, centro, span) ou None:
+-      dist   = distancia (m) da origem do base_link ate a face, no eixo x do robo
+-      ang    = quanto girar (rad, + = anti-horario) para ficar de frente (perpendicular)
+-      centro = y do centro da face (m, + = a esquerda) ou None se uma ponta nao aparece
+-    """
+-    sel = [p for p in pts if x_min <= p[0] <= x_max and abs(p[1]) <= y_lim]
+-    if len(sel) < 6:
+-        return None
+-    # reta x = a + b*y (face quase perpendicular ao robo): varre angulos de -25 a +25 graus
+-    melhor = None
+-    for k in range(-50, 51):
+-        th = math.radians(k * 0.5)
+-        c, s = math.cos(th), math.sin(th)
+-        offs = sorted((p[0] * c - p[1] * s, p) for p in sel)
+-        j = 0
+-        for i in range(len(offs)):
+-            while offs[i][0] - offs[j][0] > 0.03:
+-                j += 1
+-            n = i - j + 1
+-            # empate: prefere a reta mais proxima (a face, nao a parede atras da mesa)
+-            if melhor is None or n > melhor[0] or (n == melhor[0] and offs[j][0] < melhor[2]):
+-                melhor = (n, th, offs[j][0], (offs[i][0] + offs[j][0]) / 2.0)
+-    n, th, _, centro_off = melhor
+-    c, s = math.cos(th), math.sin(th)
+-    inl = [p for p in sel if abs(p[0] * c - p[1] * s - centro_off) <= 0.02]
+-    for _ in range(2):
+-        m = len(inl)
+-        if m < 6:
+-            return None
+-        my = sum(p[1] for p in inl) / m
+-        mx = sum(p[0] for p in inl) / m
+-        syy = sum((p[1] - my) ** 2 for p in inl)
+-        if syy < 1e-4:
+-            return None
+-        b = sum((p[1] - my) * (p[0] - mx) for p in inl) / syy
+-        a = mx - b * my
+-        inl = [p for p in sel if abs(p[0] - (a + b * p[1])) < tol]
+-    if len(inl) < 6:
+-        return None
+-    ys = sorted(p[1] for p in inl)
+-    span = ys[-1] - ys[0]
+-    if span < 0.25:
+-        return None
+-    # centro so vale se as duas pontas da face aparecem (nao foram cortadas pela janela)
+-    centro = None
+-    if 0.60 <= span <= 0.98 and ys[0] > -y_lim + 0.05 and ys[-1] < y_lim - 0.05:
+-        yc = (ys[0] + ys[-1]) / 2.0
+-        xc = a + b * yc
+-        # deslocamento do robo ao longo da face (nao muda quando o robo gira no lugar;
+-        # o y puro do centro mudava ~1 cm por grau de giro: teste de 22/10 09:36)
+-        centro = (yc + xc * b) / math.sqrt(1.0 + b * b)
+-    # normal da face no robo: (1, -b) -> girar -atan(b) para ficar perpendicular
+-    return dict(dist=a, ang=-math.atan(b), centro=centro, span=span, n=len(inl))
++def medir_face(pts, x_min=0.30, x_max=1.30, y_lim=0.70, tol=0.02, referencia=None):
++    """Face segmentada; quando ha WS conhecida seleciona pela referencia, nao por densidade."""
++    return selecionar_face(pts,referencia,x_min=x_min,x_max=x_max,y_lim=y_lim,tol=tol)
+ 
+ 
+ class Encosto:
+@@ -1909,6 +1859,7 @@ class Encosto:
+         self.avancos = 0
+         self.alvo_giro = self.alvo_lat = self.yaw_ref = None
+         self.resultado = None
++        self.obstaculo = None
+         self.p_dur = 0.15      # duracao do pulso de avanco final (s), ajustada sozinha
+         self.p_ult = None
+         self.n_pulsos = 0
+@@ -1921,6 +1872,15 @@ class Encosto:
+         self.g_final = False           # giro de acerto feito ja encostado
+ 
+     def nova_medicao(self, t, med, pose):
++        if med is None or not all(math.isfinite(med[k]) for k in ('dist', 'ang')):
++            self.meds.clear()
++            return
++        if med['centro'] is not None and not math.isfinite(med['centro']):
++            self.meds.clear()
++            return
++        if med['dist'] < self.pc:
++            self.abortar('folga negativa')
++            return
+         if med is not None:
+             self.meds.append((t, med, pose))
+             self.meds = self.meds[-12:]
+@@ -1960,6 +1920,8 @@ class Encosto:
+         return c * dx + s * dy, -s * dx + c * dy
+ 
+     def passo(self, t, pose):
++        if self.estado in ('fim', 'abortar'):
++            return 0.0, 0.0, 0.0
+         if self.t0 is None:
+             self.t0 = t
+             self._mudar('assentar', t, pose)
+@@ -1969,6 +1931,16 @@ class Encosto:
+             self.abortar('tempo maximo')
+             return 0.0, 0.0, 0.0
+         e = self.estado
++        # Nenhum movimento pode continuar usando uma face perdida ou antiga.
++        if e in ('avancar', 'pulso', 'girar', 'deslocar', 'lat_mover', 'lat_pulso') and (
++                not self.meds or not 0 <= t-self.meds[-1][0] <= 0.3
++                or self.meds[-1][1]['centro'] is None):
++            self.abortar('face ausente ou desatualizada')
++            return 0.0, 0.0, 0.0
++
++        if e in ('avancar', 'pulso') and self.obstaculo is not None:
++            self.abortar('obstaculo antes da face WS no corredor de avanco')
++            return 0.0, 0.0, 0.0
+ 
+         if e in ('assentar', 'assentar_final'):
+             if t - self.t_estado >= 0.4:
+@@ -1976,7 +1948,7 @@ class Encosto:
+             return 0.0, 0.0, 0.0
+ 
+         if e in ('medir', 'medir_final'):
+-            novas = self._novas(self.t_estado)
++            novas = [m for m in self._novas(self.t_estado) if 0 <= t-m[0] <= 0.6]
+             if len(novas) < 4 and t - self.t_estado < 3.0:
+                 return 0.0, 0.0, 0.0
+             if len(novas) < 2:
+@@ -2015,6 +1987,11 @@ class Encosto:
+                     self.log('Encostado fora do centro (%+.1f cm): corrigindo de lado' % (centro * 100))
+                     self._mudar('deslocar', t, pose)
+                     return 0.0, 0.0, 0.0
++                if not (0 <= folga and abs(folga-self.alvo) <= 0.025
++                        and abs(ang) <= self.tol_giro
++                        and centro is not None and abs(centro) <= self.tol_lat):
++                    self.abortar('medicao final fora dos limites de folga/alinhamento')
++                    return 0.0, 0.0, 0.0
+                 self.estado = 'fim'
+                 return 0.0, 0.0, 0.0
+             self.ciclos += 1
+@@ -2139,7 +2116,8 @@ class Encosto:
+                         v = max(0.0, ((m0['dist'] - self.pc) - folga) / (tl - t0_))
+                 previsto = folga - v * (t - tl + 0.35)  # 0.35 s = atraso + parada
+             else:
+-                folga = previsto = 9.0
++                self.abortar('perdi a face da mesa')
++                return 0.0, 0.0, 0.0
+             # ENCOSTO_LINEAR: vai direto ao alvo (0,10 m/s reais; a previsao para ~1 cm depois do alvo)
+             if previsto <= self.alvo + (0.0 if self.linear else 0.08) or t - self.t_estado > 15.0:
+                 self.p_ult = None
+@@ -2205,7 +2183,9 @@ def main():
+     from nav2_msgs.action import ComputePathToPose, DriveOnHeading, NavigateToPose
+     from nav2_msgs.msg import CollisionMonitorState
+     from sensor_msgs.msg import Imu, LaserScan  # SENSOR_PARADO
+-    from std_msgs.msg import String
++    from std_msgs.msg import String, Bool
++    from std_srvs.srv import SetBool, Trigger
++    from rcl_interfaces.srv import GetParameters
+     from tf2_ros import Buffer, TransformListener
+ 
+     def yaw_de(q):
+@@ -2229,6 +2209,13 @@ def main():
+             self.declare_parameter('periodo_vigia', 1.0)
+             # v3: travessia pelo LiDAR ('lidar') ou pelo Nav2 como na v2 ('nav2')
+             self.declare_parameter('modo_travessia', 'lidar')
++            self.declare_parameter('modo_curva_t', 'lateral')
++            self.declare_parameter('limite_vel_angular_real_t', -1.0)
++            self.declare_parameter('limite_vel_linear_real_t', -1.0)
++            self.declare_parameter('topico_scan_temporal_t', '/scan_temporal_front')
++            self.declare_parameter('topico_imu_temporal_t', '/imu/data_temporal')
++            if self.get_parameter('modo_curva_t').value != 'lateral':
++                raise ValueError('Giro frontal suspenso: use modo_curva_t:=lateral')
+             self.declare_parameter('sensor_idade_max', 0.5)     # SENSOR_PARADO
+             self.declare_parameter('sensor_espera_max', 60.0)
+             self.declare_parameter('sensor_espera_ponte', 6.0)
+@@ -2283,8 +2270,22 @@ def main():
+             self.tf_buffer = Buffer()
+             self.tf_listener = TransformListener(self.tf_buffer, self)
+             self.rota_tent = {}   # ROTA_MAPA
++            self.tempos_t = {}
++            self.ultimos_stamps_t = {}
++            self.odom_t_valido = False
++            self.imu_t = None
++            self.scan_t_raw = None
++            self.controle_t_ativo = False
++            self.cancelamento_t = threading.Event()
++            self.conflito_t = (0.0, True)
+             self.t_imu = None   # SENSOR_PARADO
+             self.gyro_z = 0.0
++            self.create_subscription(Imu, self.p('topico_imu_temporal_t'),
++                                     lambda msg: self.ao_imu(msg, experimental=True),
++                                     qos_profile_sensor_data, callback_group=grupo)
++            self.create_subscription(LaserScan, self.p('topico_scan_temporal_t'),
++                                     lambda msg: self.ao_scan(msg, experimental=True),
++                                     qos_profile_sensor_data, callback_group=grupo)
+             self.create_subscription(Imu, '/imu/data', self.ao_imu, qos_profile_sensor_data,
+                                      callback_group=grupo)
+             self.create_subscription(Odometry, '/odom', self.ao_odom, 20, callback_group=grupo)
+@@ -2295,6 +2296,15 @@ def main():
+             self.create_subscription(CollisionMonitorState, '/collision_monitor_state',
+                                      self.ao_cm, 10, callback_group=grupo)
+             self.pub_cmd = self.create_publisher(TwistStamped, '/cmd_vel_nav', 10)
++            self.pub_t = self.create_publisher(TwistStamped, '/cmd_vel_nav_t', 10)
++            self.controle_t = self.create_client(SetBool, '/alinhador/controle_t', callback_group=grupo)
++            self.cm_params_t = self.create_client(GetParameters, '/collision_monitor/get_parameters', callback_group=grupo)
++            self.hw_params_t = self.create_client(GetParameters, '/robo_hardware/get_parameters', callback_group=grupo)
++            self.pub_estado_t = self.create_publisher(String, '/alinhador/estado_t', 20)
++            self.create_subscription(String, '/hardware/sensor_timing', self.ao_timing_t, 20, callback_group=grupo)
++            self.create_service(Trigger, '/alinhador/cancelar_t', self.cancelar_t, callback_group=grupo)
++            self.create_subscription(Bool, '/alinhador/conflito_t', self.ao_conflito_t, 10,
++                                     callback_group=grupo)
+             # v3.31 ANTI_CISCADO: historico do comando do Nav2 e da odom; cliente do destravar
+             self.hist_cmd = collections.deque(maxlen=300)
+             self.hist_odom = collections.deque(maxlen=600)
+@@ -2337,9 +2347,79 @@ def main():
+             with self.lock:
+                 self.mapa_msg = msg
+ 
+-        def ao_imu(self, msg):   # SENSOR_PARADO
+-            self.t_imu = time.monotonic()
+-            self.gyro_z = msg.angular_velocity.z   # ANGULO_FUNDIDO
++        def ao_conflito_t(self, msg):
++            with self.lock:
++                self.conflito_t = (time.monotonic(), msg.data)
++
++        def _stamp_recente(self, stamp):
++            return TempoSensor.receber(stamp, self.get_clock().now().nanoseconds,
++                                       time.monotonic()) is not None
++
++        def _tempo_sensor_t(self, msg, sensor, atraso=0.0):
++            with self.lock:
++                ros_ns, mono = self.get_clock().now().nanoseconds, time.monotonic()
++                # Janela LiDAR deslizante pode manter o mesmo raio mais antigo.
++                # Reutiliza exatamente o prazo original; nunca renova na recepcao.
++                anterior = self.tempos_t.get(sensor)
++                stamp_ns = msg.header.stamp.sec*1000000000+msg.header.stamp.nanosec
++                if sensor == 'lidar' and anterior is not None and anterior.stamp_ns == stamp_ns:
++                    amostra = anterior if anterior.recente(ros_ns, mono) else None
++                    self.tempos_t[sensor] = amostra
++                    return amostra
++                amostra = TempoSensor.receber(msg.header.stamp,
++                    ros_ns, mono, atraso,
++                    self.ultimos_stamps_t.get(sensor))
++                self.tempos_t[sensor] = amostra
++                if amostra is not None:
++                    self.ultimos_stamps_t[sensor] = amostra.stamp_ns
++            return amostra
++
++        def ao_timing_t(self, msg):
++            try:
++                item = json.loads(msg.data)
++                if not isinstance(item, dict):
++                    raise ValueError('metadata temporal sem objeto')
++                if not item.get('timed_frame') or item.get('valid'):
++                    return
++                sensors = [item.get('sensor')]
++            except (ValueError, TypeError):
++                sensors = ['lidar', 'imu']
++            with self.lock:
++                for sensor in sensors:
++                    if sensor in ('lidar', 'imu'):
++                        self.tempos_t[sensor] = None
++                        if sensor == 'lidar':
++                            self.scan_t_raw = None
++                        else:
++                            self.imu_t = None
++
++        def cancelar_t(self, req, res):
++            self.cancelamento_t.set()
++            self._cancelar_nav()
++            res.success, res.message = True, 'cancelamento solicitado; aguarde estado parado'
++            return res
++
++        def _estado_t(self, estado, motivo='', observacao=None):
++            m = String()
++            m.data = json.dumps(dict(estado=estado, motivo=motivo,
++                                    observacao=observacao, stamp_ns=self.get_clock().now().nanoseconds))
++            self.pub_estado_t.publish(m)
++
++        def ao_imu(self, msg, experimental=False):   # SENSOR_PARADO
++            if not experimental:
++                self.t_imu = time.monotonic()
++                self.gyro_z = msg.angular_velocity.z
++                return
++            q = msg.orientation
++            valores = (q.x, q.y, q.z, q.w, msg.angular_velocity.z)
++            amostra = self._tempo_sensor_t(msg, 'imu', 0.0)
++            valida = (amostra is not None
++                      and msg.orientation_covariance[0] != -1
++                      and all(math.isfinite(v) for v in valores)
++                      and abs(sum(v*v for v in valores[:4])-1.0) < 0.05)
++            with self.lock:
++                self.imu_t = (amostra.aquisicao_mono, yaw_de(q), msg.angular_velocity.z) if valida else None
++
+ 
+         def ao_plano(self, msg):
+             with self.lock:
+@@ -2406,6 +2486,7 @@ def main():
+                 nome, ap['x'], ap['y'], math.degrees(ap['yaw'])))
+ 
+         def ao_odom(self, msg):
++            self.odom_t_valido = self._tempo_sensor_t(msg, 'odom') is not None
+             p = msg.pose.pose
+             with self.lock:
+                 self.odom = (time.monotonic(), p.position.x, p.position.y, yaw_de(p.orientation))
+@@ -2417,6 +2498,7 @@ def main():
+                 self.hist_cmd.append((time.monotonic(), tw.linear.x, tw.linear.y, tw.angular.z))
+ 
+         def ao_cmd_final(self, msg):
++            self._tempo_sensor_t(msg, 'saida')
+             tw = msg.twist
+             zerado = abs(tw.linear.x) < 1e-4 and abs(tw.linear.y) < 1e-4 and abs(tw.angular.z) < 1e-4
+             with self.lock:
+@@ -2425,7 +2507,15 @@ def main():
+         def ao_cm(self, msg):
+             self.cm_stop = msg.action_type == 1  # STOP
+ 
+-        def ao_scan(self, msg):
++        def ao_scan(self, msg, experimental=False):
++            # Fluxo temporal ja carrega limite inferior de aquisicao na ponte.
++            # Nao somar scan_time novamente; bins agregados tem time_increment=0.
++            amostra = self._tempo_sensor_t(msg, 'lidar', 0.0) if experimental else None
++            if not self._stamp_recente(msg.header.stamp):
++                if experimental:
++                    with self.lock:
++                        self.scan_t_raw = None
++                return
+             if self.laser_tf is None:
+                 try:
+                     tr = self.tf_buffer.lookup_transform('base_link', msg.header.frame_id, Time())
+@@ -2446,12 +2536,17 @@ def main():
+             frente = min([p[0] - 0.365 for p in pts if p[0] > 0.30 and abs(p[1]) < 0.33] or [9.0])
+             with self.lock:
+                 od = self.odom
+-                self.scan = (time.monotonic(), pts, od[1:] if od else None, frente)
+-                self.scan_seq += 1
++                if experimental:
++                    self.scan_t_raw = ((amostra.aquisicao_mono, tuple(msg.ranges), msg.angle_min,
++                                       msg.angle_increment, msg.range_min, msg.range_max, self.laser_tf)
++                                       if amostra is not None else None)
++                else:
++                    self.scan = (time.monotonic(), pts, od[1:] if od else None, frente)
++                    self.scan_seq += 1
+ 
+         def _novo_goal_chegou(self):
+             with self.lock:
+-                return self.goal_pendente is not None
++                return self.goal_pendente is not None or self.cancelamento_t.is_set()
+ 
+         # ---------------- utilidades ----------------
+         def _esperar(self, futuro, timeout):
+@@ -2650,7 +2745,7 @@ def main():
+             m.header.stamp = self.get_clock().now().to_msg()
+             m.header.frame_id = 'base_link'
+             m.twist.linear.x, m.twist.linear.y, m.twist.angular.z = float(vx), float(vy), float(wz)
+-            self.pub_cmd.publish(m)
++            (self.pub_t if self.controle_t_ativo else self.pub_cmd).publish(m)
+ 
+         def _parar(self):
+             for _ in range(5):
+@@ -2664,11 +2759,13 @@ def main():
+                 return None
+             return tr.transform.translation.x, tr.transform.translation.y
+ 
+-        def _pose_mapa_yaw(self):
++        def _pose_mapa_yaw(self, idade_max=None):
+             try:
+                 tr = self.tf_buffer.lookup_transform('map', 'base_link', Time())
+             except Exception:
+                 return None
++            if idade_max is not None and not self._stamp_recente(tr.header.stamp):
++                return None
+             return (tr.transform.translation.x, tr.transform.translation.y,
+                     yaw_de(tr.transform.rotation))
+ 
+@@ -3130,7 +3227,14 @@ def main():
+                         od, sc, sq, cf = self.odom, self.scan, self.scan_seq, self.cmd_final
+                     trav.entrada_rapida = self.p('entrada_rapida')
+                     trav.uma_parede = self.p('uma_parede')
+-                    pausa = self._esperar_sensores(nome)   # SENSOR_PARADO
++                    if self.controle_t_ativo:
++                        if (not self._precondicoes_t() or self.cm_stop or self.conflito_t[1]
++                                or agora-self.conflito_t[0] > 0.3 or agora-cf[0] > 0.3):
++                            trav.abortar('aproximacao experimental sem sensores/protecao/conflito')
++                            break
++                        pausa = 0.0
++                    else:
++                        pausa = self._esperar_sensores(nome)   # SENSOR_PARADO
+                     if pausa > 0.0:
+                         with self.lock:
+                             od = self.odom
+@@ -3159,7 +3263,10 @@ def main():
+                             x_esp = restante + self.p('centro_corpo') + (trav.largura_b or trav.largura or 0.82) / 2.0
+                             trav.nova_transversal(sc[0], medir_parede_a_frente(
+                                 sc[1], lado, x_max=max(0.6, x_esp + 0.35)), sc[2])
+-                    pm = self._pose_mapa()
++                    pm = (self._pose_mapa_yaw(idade_max=0.3) if self.controle_t_ativo else self._pose_mapa())
++                    if pm is None and self.controle_t_ativo:
++                        trav.abortar('TF ausente/desatualizada na aproximacao experimental')
++                        break
+                     if pm is None:
+                         sem_tf_desde = sem_tf_desde or agora
+                         if agora - sem_tf_desde > 1.0:
+@@ -3189,7 +3296,7 @@ def main():
+             finally:
+                 self._parar()
+             ok = trav.estado == 'fim'
+-            if not ok and trav.p_aprox_odom is not None:
++            if not ok and not self.controle_t_ativo and trav.p_aprox_odom is not None:
+                 # se entrou na passagem, sai de re reto (mesmo eixo) antes de qualquer outra coisa
+                 with self.lock:
+                     od = self.odom
+@@ -3201,6 +3308,195 @@ def main():
+             self.get_logger().info('%s (LiDAR): %s' % (nome, 'SUCESSO' if ok else 'FALHOU - ' + trav.motivo))
+             return 'ok' if ok else 'falha'
+ 
++        def _precondicoes_t(self):
++            # Recusa antes de iniciar o preparo de uma curva experimental.
++            with self.lock:
++                tempos, raw = dict(self.tempos_t), self.scan_t_raw
++            agora, ros_ns = time.monotonic(), self.get_clock().now().nanoseconds
++            return (math.isfinite(self.p('limite_vel_angular_real_t'))
++                    and self.p('limite_vel_angular_real_t') >= 0.10
++                    and math.isfinite(self.p('limite_vel_linear_real_t'))
++                    and self.p('limite_vel_linear_real_t') >= 0.03
++                    and all(tempos.get(sensor) is not None
++                        and tempos[sensor].recente(ros_ns, agora)
++                        for sensor in ('lidar', 'imu', 'odom'))
++                    and raw is not None and len(raw[1]) >= 3
++                    and all(math.isfinite(r) and raw[4] <= r <= raw[5] for r in raw[1])
++                    and 0 < abs(raw[3]) < math.pi/2
++                    and (math.hypot(0.365, 0.315)+0.05+math.hypot(*raw[6][:2]))
++                        *math.sin(abs(raw[3])) <= 0.05
++                    and abs(abs(raw[3])*len(raw[1])-2*math.pi) <= 1e-5)
++
++        def _verificar_cm_t(self):
++            # Nao permitir correcao angular adicional DEPOIS do Collision Monitor.
++            if not self.hw_params_t.wait_for_service(timeout_sec=1.0):
++                return False
++            hw_req = GetParameters.Request()
++            hw_req.names = ['heading_hold_enabled', 'command_authority']
++            hw = self._esperar(self.hw_params_t.call_async(hw_req), 1.0)
++            if (hw is None or len(hw.values) != 2 or hw.values[0].type != 1 or hw.values[0].bool_value
++                    or hw.values[1].string_value != 'collision_monitor'):
++                return False
++            if not self.cm_params_t.wait_for_service(timeout_sec=1.0):
++                return False
++            req = GetParameters.Request()
++            req.names = ['polygons', 'SweptTurnStop.enabled', 'SweptTurnStop.min_points',
++                         'cmd_vel_in_topic', 'cmd_vel_out_topic']
++            for name in ('left_turn', 'right_turn'):
++                req.names += ['SweptTurnStop.'+name+'.'+key for key in
++                    ('points', 'linear_min', 'linear_max', 'theta_min', 'theta_max',
++                     'direction_start_angle', 'direction_end_angle')]
++            r = self._esperar(self.cm_params_t.call_async(req), 1.0)
++            if r is None or len(r.values) != len(req.names):
++                return False
++            try:
++                for i, direction in ((5, 1), (12, -1)):
++                    v = r.values[i:i+7]
++                    if (not envolve_disco(json.loads(v[0].string_value), math.hypot(.365,.315)+.05)
++                            or v[1].double_value > 0 or v[2].double_value < math.hypot(.2,.16)
++                            or v[3].double_value > (0.015 if direction > 0 else -0.6)
++                            or v[4].double_value < (0.6 if direction > 0 else -0.015)
++                            or v[5].double_value > -math.pi or v[6].double_value < math.pi):
++                        return False
++            except (ValueError, TypeError):
++                return False
++            return ('SweptTurnStop' in r.values[0].string_array_value
++                    and r.values[1].bool_value and r.values[2].integer_value == 1
++                    and r.values[3].string_value.lstrip('/') == 'cmd_vel_smoothed'
++                    and r.values[4].string_value.lstrip('/') == 'cmd_vel')
++
++        def _arbitro_exclusivo(self):
++            saidas = self.get_publishers_info_by_topic('/cmd_vel_nav_seguro')
++            entradas = self.get_publishers_info_by_topic('/cmd_vel_nav_t')
++            return (len(saidas) == 1 and saidas[0].node_name == 'arbitro_t'
++                    and len(entradas) == 1 and entradas[0].node_name == self.get_name()
++                    and all(len(pubs) == 1 and pubs[0].node_name == esperado
++                        for pubs, esperado in ((self.get_publishers_info_by_topic('/cmd_vel_smoothed'), 'velocity_smoother'),
++                                               (self.get_publishers_info_by_topic('/cmd_vel'), 'collision_monitor'))))
++
++        def _adquirir_t(self, gf):
++            if not self.controle_t.wait_for_service(timeout_sec=1.0):
++                gf.abortar('arbitro_t indisponivel; use navigation.launch.py atualizado')
++                return False
++            if not self._arbitro_exclusivo():
++                gf.abortar('topologia de comandos sem exclusividade')
++                return False
++            if not self._verificar_cm_t():
++                gf.abortar('protecao CM/autoridade do hardware/heading_hold nao confirmada')
++                return False
++            # Antes do lease: cancelar e confirmar o resultado terminal do Nav2.
++            h = self.handle_ativo
++            if h is not None:
++                self._esperar(h.cancel_goal_async(), 2.0)
++                r = self._esperar(h.get_result_async(), 3.0)
++                if r is None or r.status not in (4, 5, 6):
++                    gf.abortar('Nav2 nao confirmou parada')
++                    return False
++            req = SetBool.Request()
++            req.data = True
++            # Nao abandonar um futuro de aquisicao pendente por cancelamento:
++            # a resposta deve ser consumida; falhas mantem o bloqueio seguro.
++            f = self.controle_t.call_async(req)
++            limite = time.monotonic()+2.0
++            while not f.done() and time.monotonic() < limite:
++                time.sleep(0.02)
++            if not f.done():
++                gf.abortar('timeout do arbitro')
++                # Aquisicao tardia fica bloqueada pelo watchdog ate reset manual.
++                return False
++            adquirido = f.result().success
++            if not adquirido:
++                gf.abortar('outro controlador ativo')
++                return False
++            self.controle_t_ativo = True
++            return True
++
++        def _aproximar_t(self, info, curva, nome, parada, largura_b):
++            guarda = GiroFrontal(curva['juncao'], curva['eixo_b'], curva['saida_b'])
++            ok = False
++            try:
++                if not self._adquirir_t(guarda):
++                    return 'falha'
++                self._estado_t('aproximar_centro')
++                r = self._travessia_lidar(info, nome, parada, None, largura_b)
++                ok = r == 'ok'
++                return r
++            finally:
++                if not ok:
++                    self._parar()
++                    self.controle_t_ativo = False
++                    self._estado_t('abortar', guarda.motivo or 'aproximacao interrompida; watchdog estaciona')
++
++        def _travessia_giro_frontal(self, curva, nome):
++            """Lease exclusivo; todas as falhas terminam em zero, sem fallback lateral."""
++            gf = GiroFrontal(curva['juncao'], curva['eixo_b'], curva['saida_b'],
++                             margem=self.p('margem_saida_lateral'))
++            adquirido = False
++            try:
++                adquirido = getattr(self, 'controle_t_ativo', False) or self._adquirir_t(gf)
++                if not adquirido:
++                    return 'falha'
++                self._estado_t('parar')
++                self._parar()
++                while rclpy.ok():
++                    with self.lock:
++                        od, raw, imu, cf, conflito = (self.odom, self.scan_t_raw, self.imu_t,
++                                                     self.cmd_final, self.conflito_t)
++                        tempos = dict(self.tempos_t)
++                    agora = time.monotonic()
++                    pm = self._pose_mapa_yaw(idade_max=0.3)
++                    if not self.odom_t_valido or od is None or not 0 <= agora-od[0] <= 0.3:
++                        pm = None
++                    # Giro: disco dos cantos + 5 cm. Avanco: footprint dilatado
++                    # em 5 cm e mais 12 cm a frente para latencia/frenagem.
++                    raio = math.hypot(0.365, 0.315)+0.05
++                    caixa = (-0.255, 0.535, -0.365, 0.365) if gf.estado == 'avancar' else None
++                    omega_max = self.p('limite_vel_angular_real_t')
++                    v_max = self.p('limite_vel_linear_real_t')
++                    idade = max(0.0, time.monotonic()-raw[0]) if raw else math.inf
++                    dentro_limites = (math.isfinite(omega_max) and omega_max >= 0.10
++                                      and math.isfinite(v_max) and v_max >= 0.03
++                                      and imu is not None and abs(imu[2]) <= omega_max)
++                    observacao = (avaliar_varredura(*raw[1:], raio, caixa=caixa,
++                                      movimento_angular=omega_max*idade,
++                                      movimento_linear=v_max*idade)
++                                  if raw is not None and dentro_limites else Observacao.DESCONHECIDA)
++                    agora = time.monotonic()
++                    ros_ns = self.get_clock().now().nanoseconds
++                    recentes = all(tempos.get(nome_sensor) is not None
++                                   and tempos[nome_sensor].recente(ros_ns, agora)
++                                   for nome_sensor in ('lidar', 'imu', 'odom', 'saida'))
++                    if not recentes:
++                        gf.abortar('idade total invalida/atraso de aquisicao desconhecido')
++                    elif observacao is not Observacao.LIVRE:
++                        gf.abortar('area varrida: '+observacao.value)
++                    cmd = gf.passo(agora, pm, imu, raw[0] if raw else None,
++                                   observacao is Observacao.LIVRE,
++                                   agora-cf[0] <= 0.3 and cf[1],
++                                   cancelado=self._novo_goal_chegou(),
++                                   bloqueado=(self.cm_stop or conflito[1] or agora-conflito[0] > 0.3
++                                              or agora-cf[0] > 0.3 or not self._arbitro_exclusivo()))
++                    self._estado_t(gf.estado, gf.motivo, observacao.value)
++                    self._publicar_vel(*cmd)
++                    if gf.estado in ('fim', 'abortar'):
++                        break
++                    time.sleep(0.05)
++            finally:
++                self._parar()
++                if adquirido and gf.estado == 'fim':
++                    req = SetBool.Request()
++                    req.data = False
++                    self._estado_t('devolvendo')
++                    confirmado, motivo = devolver_controle(self.controle_t, req,
++                        lambda: self._publicar_vel(0.0, 0.0, 0.0))
++                    if not confirmado:
++                        gf.abortar(motivo)
++                # Em falha, watchdog estaciona o arbitro sem liberar fontes normais.
++                self.controle_t_ativo = False
++                self._estado_t(gf.estado, gf.motivo)
++                self.get_logger().info('%s giro frontal: %s %s' % (nome, gf.estado, gf.motivo))
++            return 'ok' if gf.estado == 'fim' else 'falha'
++
+         def _travessia_lateral(self, curva, nome):
+             """v3.11: do cruzamento, sai de lado pelo corredor novo. Devolve 'ok' ou 'falha'."""
+             bx, by = curva['eixo_b']
+@@ -3245,12 +3541,10 @@ def main():
+                         tl.nova_medicao(sc[0], medir_corredor_lateral(
+                             sc[1], tl.lado, tl.largura, self.p('centro_corpo')), sc[2])
+                         tl.nova_folga(sc[0], *folgas_lateral(sc[1], tl.lado))
+-                    pm = self._pose_mapa()
++                    pm = self._pose_mapa_yaw(idade_max=0.3)
+                     if pm is None:
+-                        sem_tf_desde = sem_tf_desde or agora
+-                        if agora - sem_tf_desde > 1.0:
+-                            tl.abortar('sem TF map->base_link')
+-                            break
++                        tl.abortar('TF map->base_link ausente/desatualizada; restante desconhecido')
++                        break
+                     else:
+                         sem_tf_desde = None
+                         restante = margem - ((pm[0] - sx) * bx + (pm[1] - sy) * by)
+@@ -3278,6 +3572,15 @@ def main():
+ 
+         def _encostar(self, nome):
+             """Da pose de aproximacao: alinha com a face pelo LiDAR e avanca ate a distancia."""
++            try:
++                import yaml
++                with open(self.p('arquivo_areas')) as fp:
++                    face = (yaml.safe_load(fp) or {})['service_areas'][nome]['face']
++                rastreio = RastreioFaceWS(face)
++            except (OSError, KeyError, TypeError, ValueError) as exc:
++                self._parar()
++                self._publicar_resultado(nome, False, 'referencia WS indisponivel: '+str(exc))
++                return
+             enc = Encosto(linear=self.p('encosto_linear'),
+                           distancia_alvo=self.p('distancia_encosto'), para_choque=self.p('para_choque'),
+                           log=lambda m: self.get_logger().info('ENCOSTAR %s: %s' % (nome, m)))
+@@ -3303,7 +3606,13 @@ def main():
+                         break
+                     if sq != seq and sc is not None and sc[2] is not None:
+                         seq = sq
+-                        enc.nova_medicao(sc[0], medir_face(sc[1]), sc[2])
++                        pm = self._pose_mapa_yaw(idade_max=0.3)
++                        pose_scan = pose_mapa_no_scan(pm,od[1:],sc[2]) if pm is not None else None
++                        med = rastreio.medir(sc[1],sc[0],sc[2],pose_scan)
++                        enc.nova_medicao(sc[0], med, sc[2])
++                        enc.obstaculo = obstaculo_antes_da_face(sc[1],med,enc.pc)
++                        if med is None:
++                            self.get_logger().info('ENCOSTAR %s: %s' % (nome,rastreio.motivo))
+                     vx, vy, wz = enc.passo(agora, od[1:])
+                     if enc.estado in ('fim', 'abortar'):
+                         break
+@@ -3408,6 +3717,7 @@ def main():
+                     self.evento.clear()
+                 if goal is None:
+                     continue
++                self.cancelamento_t.clear()
+                 try:
+                     if self.encostado:
+                         # de frente para a mesa a 8 cm, girar bate a quina: sai de re reto antes
+@@ -3500,6 +3810,12 @@ def main():
+                             info['eixo_graus'], info['largura_mapa'], info['distancia_preparo']))
+                     self._publicar_etapas(etapas)
+                     e = etapas[0]
++                    if (info.get('curva') is not None and self.p('modo_curva_t') == 'giro_frontal'
++                            and not self._precondicoes_t()):
++                        self._parar()
++                        self.get_logger().error('Curva experimental recusada antes do preparo: '
++                            'temporalidade, limites reais de movimento ou cobertura angular insuficientes')
++                        return
+                     ok = self._chegar_preparo(e, 'PREPARO %d (alinhar fora da passagem)' % len(tratadas)) == 'ok'
+                     if ok:
+                         # De perto o mapa da passagem fica melhor: refina uma vez.
+@@ -3535,11 +3851,12 @@ def main():
+                             ax_ = math.cos(math.radians(info['eixo_graus']))
+                             ay_ = math.sin(math.radians(info['eixo_graus']))
+                             jx, jy = curva['juncao']
+-                            parada = (jx - self.p('centro_corpo') * ax_, jy - self.p('centro_corpo') * ay_)
++                            parada = ((jx, jy) if self.p('modo_curva_t') == 'giro_frontal' else
++                                      (jx - self.p('centro_corpo') * ax_, jy - self.p('centro_corpo') * ay_))
+                             self.get_logger().info(
+                                 'Passagem %d termina num cruzamento em (%.2f, %.2f) com curva para a %s: '
+-                                'paro no cruzamento e saio de lado (sem girar)' % (
+-                                    n, jx, jy, 'ESQUERDA' if curva['lado'] > 0 else 'DIREITA'))
++                                'modo de curva: %s' % (
++                                    n, jx, jy, 'ESQUERDA' if curva['lado'] > 0 else 'DIREITA', self.p('modo_curva_t')))
+                         elif info.get('cruzamentos'):
+                             self.get_logger().info('Passagem %d atravessa %d cruzamento(s) reto(s): '
+                                                    'uma travessia so ate (%.2f, %.2f)' % (
+@@ -3547,15 +3864,34 @@ def main():
+                                                        info['saida'][1]))
+                         lado_c = curva['lado'] if curva is not None else None
+                         larg_b = curva.get('largura_b') if curva is not None else None
+-                        r = self._travessia_lidar(info, 'TRAVESSIA %d' % n, parada, lado_c, larg_b)
++                        lado_parada = None if self.p('modo_curva_t') == 'giro_frontal' else lado_c
++                        experimental_t = curva is not None and self.p('modo_curva_t') == 'giro_frontal'
++                        if experimental_t:
++                            r = self._aproximar_t(info, curva, 'TRAVESSIA %d' % n, parada, larg_b)
++                            if r != 'ok':
++                                self.get_logger().error('Aproximacao experimental interrompida, sem retentativa automatica')
++                                return
++                        else:
++                            r = self._travessia_lidar(info, 'TRAVESSIA %d' % n, parada, lado_parada, larg_b)
+                         if r != 'ok':
+                             self.get_logger().warn('Travessia pelo LiDAR falhou: voltando ao preparo '
+                                                    'para tentar de novo.')
+                             if self._chegar_preparo(e, 'PREPARO %d (2a tentativa)' % n) == 'ok':
+-                                r = self._travessia_lidar(info, 'TRAVESSIA %d (2a tentativa)' % n, parada, lado_c, larg_b)
++                                r = self._travessia_lidar(info, 'TRAVESSIA %d (2a tentativa)' % n,
++                                                          parada, lado_parada, larg_b)
+                         if r == 'ok' and curva is not None:
+-                            r = self._travessia_lateral(curva, 'CURVA %d' % n)
++                            if self.p('modo_curva_t') == 'giro_frontal':
++                                r = self._travessia_giro_frontal(curva, 'CURVA %d' % n)
++                            else:
++                                r = self._travessia_lateral(curva, 'CURVA %d' % n)
+                             if r == 'ok':
++                                if self.p('modo_curva_t') == 'giro_frontal':
++                                    self.get_logger().info('Curva concluida e devolucao confirmada: '
++                                        'arbitro parado. Retome explicitamente apos conferir a area.')
++                                    if area is not None:
++                                        self._publicar_resultado(area, False,
++                                            'curva concluida; missao interrompida para retomada supervisionada')
++                                    return
+                                 tratadas.append(curva['entrada_b'])
+                                 continue  # reanalisa o caminho a partir da saida do corredor novo
+                             self.get_logger().error(

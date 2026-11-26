@@ -1,0 +1,1001 @@
+diff --git a/src/robo_navigation/CMakeLists.txt b/src/robo_navigation/CMakeLists.txt
+index 3c0f4d3..0b0f114 100644
+--- a/src/robo_navigation/CMakeLists.txt
++++ b/src/robo_navigation/CMakeLists.txt
+@@ -8,4 +8,9 @@ install(
+   DESTINATION share/${PROJECT_NAME}
+ )
+ 
++if(BUILD_TESTING)
++  find_package(ament_cmake_pytest REQUIRED)
++  ament_add_pytest_test(giro_frontal test/test_giro_frontal.py)
++endif()
++
+ ament_package()
+diff --git a/src/robo_navigation/launch/navigation.launch.py b/src/robo_navigation/launch/navigation.launch.py
+index d1bda3a..ace2f60 100644
+--- a/src/robo_navigation/launch/navigation.launch.py
++++ b/src/robo_navigation/launch/navigation.launch.py
+@@ -14,6 +14,7 @@ def generate_launch_description():
+     use_sim_time = LaunchConfiguration("use_sim_time")
+     autostart = LaunchConfiguration("autostart")
+     params_file = LaunchConfiguration("params_file")
++    modo_curva_t = LaunchConfiguration("modo_curva_t")
+ 
+     navigation_share = get_package_share_directory("robo_navigation")
+     default_params_file = os.path.join(
+@@ -93,6 +94,8 @@ def generate_launch_description():
+ 
+     return LaunchDescription(
+         [
++            DeclareLaunchArgument("modo_curva_t", default_value="lateral",
++                                  choices=["lateral", "giro_frontal"]),
+             DeclareLaunchArgument(
+                 "use_sim_time",
+                 default_value="false",
+@@ -167,8 +170,8 @@ def generate_launch_description():
+                 name="velocity_smoother",
+                 output="screen",
+                 parameters=common_parameters,
+-                # Entrada: /cmd_vel_nav; saida preservada em /cmd_vel_smoothed.
+-                remappings=common_remappings + [("cmd_vel", "cmd_vel_nav")],
++                # Entrada arbitrada: /cmd_vel_nav_seguro; saida /cmd_vel_smoothed.
++                remappings=common_remappings + [("cmd_vel", "cmd_vel_nav_seguro")],
+             ),
+             Node(
+                 package="nav2_collision_monitor",
+@@ -189,9 +192,15 @@ def generate_launch_description():
+                     "~/robo_jazzy_ws/src/robo_navigation/scripts/destravar_node.py")],
+                 output="screen",
+             ),
++            ExecuteProcess(
++                cmd=["python3", os.path.expanduser(
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/arbitro_t.py")],
++                output="screen",
++            ),
+             ExecuteProcess(  # NAV_TUDO: alinhador: passagens, mesas, START/FINISH
+                 cmd=["python3", os.path.expanduser(
+-                    "~/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py")],
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py"),
++                     "--ros-args", "-p", ["modo_curva_t:=", modo_curva_t]],
+                 output="screen",
+             ),
+             ExecuteProcess(  # SUAVIZADOR_NAV: /cmd_vel_ctrl -> /cmd_vel_nav
+diff --git a/src/robo_navigation/package.xml b/src/robo_navigation/package.xml
+index ca6d94d..1fcf4e0 100644
+--- a/src/robo_navigation/package.xml
++++ b/src/robo_navigation/package.xml
+@@ -27,8 +27,13 @@
+   <exec_depend>nav2_velocity_smoother</exec_depend>
+   <exec_depend>nav2_collision_monitor</exec_depend>
+ 
++  <test_depend>ament_cmake_pytest</test_depend>
++
+   <export>
+     <build_type>ament_cmake</build_type>
+   </export>
+   <exec_depend>robo_recovery</exec_depend>
++  <exec_depend>std_srvs</exec_depend>
++  <exec_depend>std_msgs</exec_depend>
++  <exec_depend>geometry_msgs</exec_depend>
+ </package>
+diff --git a/src/robo_navigation/scripts/alinhador_passagem.py b/src/robo_navigation/scripts/alinhador_passagem.py
+index eec1c78..69937c4 100644
+--- a/src/robo_navigation/scripts/alinhador_passagem.py
++++ b/src/robo_navigation/scripts/alinhador_passagem.py
+@@ -188,6 +188,7 @@ import math
+ import os
+ import threading
+ import time
++from giro_frontal import GiroFrontal, disco_observado
+ 
+ # ---------------------------------------------------------------------------
+ # Nucleo geometrico (sem ROS: pode ser testado fora do robo)
+@@ -1921,6 +1922,15 @@ class Encosto:
+         self.g_final = False           # giro de acerto feito ja encostado
+ 
+     def nova_medicao(self, t, med, pose):
++        if med is None or not all(math.isfinite(med[k]) for k in ('dist', 'ang')):
++            self.meds.clear()
++            return
++        if med['centro'] is not None and not math.isfinite(med['centro']):
++            self.meds.clear()
++            return
++        if med['dist'] < self.pc:
++            self.abortar('folga negativa')
++            return
+         if med is not None:
+             self.meds.append((t, med, pose))
+             self.meds = self.meds[-12:]
+@@ -1960,6 +1970,8 @@ class Encosto:
+         return c * dx + s * dy, -s * dx + c * dy
+ 
+     def passo(self, t, pose):
++        if self.estado in ('fim', 'abortar'):
++            return 0.0, 0.0, 0.0
+         if self.t0 is None:
+             self.t0 = t
+             self._mudar('assentar', t, pose)
+@@ -1969,6 +1981,11 @@ class Encosto:
+             self.abortar('tempo maximo')
+             return 0.0, 0.0, 0.0
+         e = self.estado
++        # Nenhum movimento pode continuar usando uma face perdida ou antiga.
++        if e in ('avancar', 'pulso', 'girar', 'deslocar', 'lat_mover', 'lat_pulso') and (
++                not self.meds or not 0 <= t-self.meds[-1][0] <= 0.3):
++            self.abortar('face ausente ou desatualizada')
++            return 0.0, 0.0, 0.0
+ 
+         if e in ('assentar', 'assentar_final'):
+             if t - self.t_estado >= 0.4:
+@@ -1976,7 +1993,7 @@ class Encosto:
+             return 0.0, 0.0, 0.0
+ 
+         if e in ('medir', 'medir_final'):
+-            novas = self._novas(self.t_estado)
++            novas = [m for m in self._novas(self.t_estado) if 0 <= t-m[0] <= 0.6]
+             if len(novas) < 4 and t - self.t_estado < 3.0:
+                 return 0.0, 0.0, 0.0
+             if len(novas) < 2:
+@@ -2015,6 +2032,11 @@ class Encosto:
+                     self.log('Encostado fora do centro (%+.1f cm): corrigindo de lado' % (centro * 100))
+                     self._mudar('deslocar', t, pose)
+                     return 0.0, 0.0, 0.0
++                if not (0 <= folga and abs(folga-self.alvo) <= 0.025
++                        and abs(ang) <= self.tol_giro
++                        and centro is not None and abs(centro) <= self.tol_lat):
++                    self.abortar('medicao final fora dos limites de folga/alinhamento')
++                    return 0.0, 0.0, 0.0
+                 self.estado = 'fim'
+                 return 0.0, 0.0, 0.0
+             self.ciclos += 1
+@@ -2139,7 +2161,8 @@ class Encosto:
+                         v = max(0.0, ((m0['dist'] - self.pc) - folga) / (tl - t0_))
+                 previsto = folga - v * (t - tl + 0.35)  # 0.35 s = atraso + parada
+             else:
+-                folga = previsto = 9.0
++                self.abortar('perdi a face da mesa')
++                return 0.0, 0.0, 0.0
+             # ENCOSTO_LINEAR: vai direto ao alvo (0,10 m/s reais; a previsao para ~1 cm depois do alvo)
+             if previsto <= self.alvo + (0.0 if self.linear else 0.08) or t - self.t_estado > 15.0:
+                 self.p_ult = None
+@@ -2205,7 +2228,8 @@ def main():
+     from nav2_msgs.action import ComputePathToPose, DriveOnHeading, NavigateToPose
+     from nav2_msgs.msg import CollisionMonitorState
+     from sensor_msgs.msg import Imu, LaserScan  # SENSOR_PARADO
+-    from std_msgs.msg import String
++    from std_msgs.msg import String, Bool
++    from std_srvs.srv import SetBool
+     from tf2_ros import Buffer, TransformListener
+ 
+     def yaw_de(q):
+@@ -2229,6 +2253,9 @@ def main():
+             self.declare_parameter('periodo_vigia', 1.0)
+             # v3: travessia pelo LiDAR ('lidar') ou pelo Nav2 como na v2 ('nav2')
+             self.declare_parameter('modo_travessia', 'lidar')
++            self.declare_parameter('modo_curva_t', 'lateral')
++            if self.get_parameter('modo_curva_t').value not in ('lateral', 'giro_frontal'):
++                raise ValueError('modo_curva_t deve ser lateral ou giro_frontal')
+             self.declare_parameter('sensor_idade_max', 0.5)     # SENSOR_PARADO
+             self.declare_parameter('sensor_espera_max', 60.0)
+             self.declare_parameter('sensor_espera_ponte', 6.0)
+@@ -2283,6 +2310,11 @@ def main():
+             self.tf_buffer = Buffer()
+             self.tf_listener = TransformListener(self.tf_buffer, self)
+             self.rota_tent = {}   # ROTA_MAPA
++            self.odom_t_valido = False
++            self.imu_t = None
++            self.scan_t_raw = None
++            self.controle_t_ativo = False
++            self.conflito_t = (0.0, True)
+             self.t_imu = None   # SENSOR_PARADO
+             self.gyro_z = 0.0
+             self.create_subscription(Imu, '/imu/data', self.ao_imu, qos_profile_sensor_data,
+@@ -2295,6 +2327,10 @@ def main():
+             self.create_subscription(CollisionMonitorState, '/collision_monitor_state',
+                                      self.ao_cm, 10, callback_group=grupo)
+             self.pub_cmd = self.create_publisher(TwistStamped, '/cmd_vel_nav', 10)
++            self.pub_t = self.create_publisher(TwistStamped, '/cmd_vel_nav_t', 10)
++            self.controle_t = self.create_client(SetBool, '/alinhador/controle_t', callback_group=grupo)
++            self.create_subscription(Bool, '/alinhador/conflito_t', self.ao_conflito_t, 10,
++                                     callback_group=grupo)
+             # v3.31 ANTI_CISCADO: historico do comando do Nav2 e da odom; cliente do destravar
+             self.hist_cmd = collections.deque(maxlen=300)
+             self.hist_odom = collections.deque(maxlen=600)
+@@ -2337,7 +2373,24 @@ def main():
+             with self.lock:
+                 self.mapa_msg = msg
+ 
++        def ao_conflito_t(self, msg):
++            with self.lock:
++                self.conflito_t = (time.monotonic(), msg.data)
++
++        def _stamp_recente(self, stamp):
++            idade = (self.get_clock().now().nanoseconds -
++                     (stamp.sec * 1000000000 + stamp.nanosec)) / 1e9
++            return 0 <= idade <= 0.3
++
+         def ao_imu(self, msg):   # SENSOR_PARADO
++            q = msg.orientation
++            valores = (q.x, q.y, q.z, q.w, msg.angular_velocity.z)
++            valida = (self._stamp_recente(msg.header.stamp)
++                      and msg.orientation_covariance[0] != -1
++                      and all(math.isfinite(v) for v in valores)
++                      and abs(sum(v*v for v in valores[:4])-1.0) < 0.05)
++            with self.lock:
++                self.imu_t = (time.monotonic(), yaw_de(q), msg.angular_velocity.z) if valida else None
+             self.t_imu = time.monotonic()
+             self.gyro_z = msg.angular_velocity.z   # ANGULO_FUNDIDO
+ 
+@@ -2406,6 +2459,7 @@ def main():
+                 nome, ap['x'], ap['y'], math.degrees(ap['yaw'])))
+ 
+         def ao_odom(self, msg):
++            self.odom_t_valido = self._stamp_recente(msg.header.stamp)
+             p = msg.pose.pose
+             with self.lock:
+                 self.odom = (time.monotonic(), p.position.x, p.position.y, yaw_de(p.orientation))
+@@ -2426,6 +2480,10 @@ def main():
+             self.cm_stop = msg.action_type == 1  # STOP
+ 
+         def ao_scan(self, msg):
++            if not self._stamp_recente(msg.header.stamp):
++                with self.lock:
++                    self.scan_t_raw = None
++                return
+             if self.laser_tf is None:
+                 try:
+                     tr = self.tf_buffer.lookup_transform('base_link', msg.header.frame_id, Time())
+@@ -2446,6 +2504,8 @@ def main():
+             frente = min([p[0] - 0.365 for p in pts if p[0] > 0.30 and abs(p[1]) < 0.33] or [9.0])
+             with self.lock:
+                 od = self.odom
++                self.scan_t_raw = (time.monotonic(), tuple(msg.ranges), msg.angle_min,
++                                   msg.angle_increment, msg.range_min, msg.range_max, self.laser_tf)
+                 self.scan = (time.monotonic(), pts, od[1:] if od else None, frente)
+                 self.scan_seq += 1
+ 
+@@ -2650,7 +2710,7 @@ def main():
+             m.header.stamp = self.get_clock().now().to_msg()
+             m.header.frame_id = 'base_link'
+             m.twist.linear.x, m.twist.linear.y, m.twist.angular.z = float(vx), float(vy), float(wz)
+-            self.pub_cmd.publish(m)
++            (self.pub_t if self.controle_t_ativo else self.pub_cmd).publish(m)
+ 
+         def _parar(self):
+             for _ in range(5):
+@@ -2664,11 +2724,13 @@ def main():
+                 return None
+             return tr.transform.translation.x, tr.transform.translation.y
+ 
+-        def _pose_mapa_yaw(self):
++        def _pose_mapa_yaw(self, idade_max=None):
+             try:
+                 tr = self.tf_buffer.lookup_transform('map', 'base_link', Time())
+             except Exception:
+                 return None
++            if idade_max is not None and not self._stamp_recente(tr.header.stamp):
++                return None
+             return (tr.transform.translation.x, tr.transform.translation.y,
+                     yaw_de(tr.transform.rotation))
+ 
+@@ -3201,6 +3263,91 @@ def main():
+             self.get_logger().info('%s (LiDAR): %s' % (nome, 'SUCESSO' if ok else 'FALHOU - ' + trav.motivo))
+             return 'ok' if ok else 'falha'
+ 
++        def _arbitro_exclusivo(self):
++            saidas = self.get_publishers_info_by_topic('/cmd_vel_nav_seguro')
++            entradas = self.get_publishers_info_by_topic('/cmd_vel_nav_t')
++            return (len(saidas) == 1 and saidas[0].node_name == 'arbitro_t'
++                    and len(entradas) == 1 and entradas[0].node_name == self.get_name())
++
++        def _travessia_giro_frontal(self, curva, nome):
++            """Lease exclusivo; todas as falhas terminam em zero, sem fallback lateral."""
++            gf = GiroFrontal(curva['juncao'], curva['eixo_b'], curva['saida_b'],
++                             margem=self.p('margem_saida_lateral'))
++            adquirido = False
++            try:
++                if not self.controle_t.wait_for_service(timeout_sec=1.0):
++                    gf.abortar('arbitro_t indisponivel; use navigation.launch.py atualizado')
++                    return 'falha'
++                if not self._arbitro_exclusivo():
++                    gf.abortar('topologia de comandos sem exclusividade')
++                    return 'falha'
++                # Antes do lease: cancelar e confirmar o resultado terminal do Nav2.
++                h = self.handle_ativo
++                if h is not None:
++                    self._esperar(h.cancel_goal_async(), 2.0)
++                    r = self._esperar(h.get_result_async(), 3.0)
++                    if r is None or r.status not in (4, 5, 6):
++                        gf.abortar('Nav2 nao confirmou parada')
++                        return 'falha'
++                req = SetBool.Request()
++                req.data = True
++                # Nao abandonar um futuro de aquisicao pendente por cancelamento:
++                # a resposta deve ser consumida; falhas mantem o bloqueio seguro.
++                f = self.controle_t.call_async(req)
++                limite = time.monotonic()+2.0
++                while not f.done() and time.monotonic() < limite:
++                    time.sleep(0.02)
++                if not f.done():
++                    gf.abortar('timeout do arbitro')
++                    # Aquisicao tardia fica bloqueada pelo watchdog ate reset manual.
++                    return 'falha'
++                adquirido = f.result().success
++                if not adquirido:
++                    gf.abortar('outro controlador ativo')
++                    return 'falha'
++                self.controle_t_ativo = True
++                self._parar()
++                while rclpy.ok():
++                    agora = time.monotonic()
++                    with self.lock:
++                        od, raw, imu, cf, conflito = (self.odom, self.scan_t_raw, self.imu_t,
++                                                     self.cmd_final, self.conflito_t)
++                    pm = self._pose_mapa_yaw(idade_max=0.3)
++                    if not self.odom_t_valido or od is None or not 0 <= agora-od[0] <= 0.3:
++                        pm = None
++                    # Giro: disco dos cantos + 5 cm. Avanco: footprint dilatado
++                    # em 5 cm e mais 12 cm a frente para latencia/frenagem.
++                    raio = math.hypot(0.365, 0.315)+0.05
++                    caixa = (-0.255, 0.535, -0.365, 0.365) if gf.estado == 'avancar' else None
++                    livre = raw is not None and disco_observado(*raw[1:], raio, caixa=caixa)
++                    cmd = gf.passo(agora, pm, imu, raw[0] if raw else None, livre,
++                                   agora-cf[0] <= 0.3 and cf[1],
++                                   cancelado=self._novo_goal_chegou(),
++                                   bloqueado=(self.cm_stop or conflito[1] or agora-conflito[0] > 0.3
++                                              or agora-cf[0] > 0.3 or not self._arbitro_exclusivo()))
++                    self._publicar_vel(*cmd)
++                    if gf.estado in ('fim', 'abortar'):
++                        break
++                    time.sleep(0.05)
++            finally:
++                self._parar()
++                if adquirido and gf.estado == 'fim':
++                    # So sucesso libera automaticamente. Falhas deixam lease/watchdog
++                    # travados em zero ate reset manual, impedindo retomada concorrente.
++                    limite = time.monotonic()+0.3
++                    while time.monotonic() < limite:
++                        self._publicar_vel(0.0, 0.0, 0.0)
++                        time.sleep(0.05)
++                    req = SetBool.Request()
++                    req.data = False
++                    f = self.controle_t.call_async(req)
++                    limite = time.monotonic()+1.0
++                    while not f.done() and time.monotonic() < limite:
++                        time.sleep(0.02)
++                self.controle_t_ativo = False
++                self.get_logger().info('%s giro frontal: %s %s' % (nome, gf.estado, gf.motivo))
++            return 'ok' if gf.estado == 'fim' else 'falha'
++
+         def _travessia_lateral(self, curva, nome):
+             """v3.11: do cruzamento, sai de lado pelo corredor novo. Devolve 'ok' ou 'falha'."""
+             bx, by = curva['eixo_b']
+@@ -3535,11 +3682,12 @@ def main():
+                             ax_ = math.cos(math.radians(info['eixo_graus']))
+                             ay_ = math.sin(math.radians(info['eixo_graus']))
+                             jx, jy = curva['juncao']
+-                            parada = (jx - self.p('centro_corpo') * ax_, jy - self.p('centro_corpo') * ay_)
++                            parada = ((jx, jy) if self.p('modo_curva_t') == 'giro_frontal' else
++                                      (jx - self.p('centro_corpo') * ax_, jy - self.p('centro_corpo') * ay_))
+                             self.get_logger().info(
+                                 'Passagem %d termina num cruzamento em (%.2f, %.2f) com curva para a %s: '
+-                                'paro no cruzamento e saio de lado (sem girar)' % (
+-                                    n, jx, jy, 'ESQUERDA' if curva['lado'] > 0 else 'DIREITA'))
++                                'modo de curva: %s' % (
++                                    n, jx, jy, 'ESQUERDA' if curva['lado'] > 0 else 'DIREITA', self.p('modo_curva_t')))
+                         elif info.get('cruzamentos'):
+                             self.get_logger().info('Passagem %d atravessa %d cruzamento(s) reto(s): '
+                                                    'uma travessia so ate (%.2f, %.2f)' % (
+@@ -3547,14 +3695,19 @@ def main():
+                                                        info['saida'][1]))
+                         lado_c = curva['lado'] if curva is not None else None
+                         larg_b = curva.get('largura_b') if curva is not None else None
+-                        r = self._travessia_lidar(info, 'TRAVESSIA %d' % n, parada, lado_c, larg_b)
++                        lado_parada = None if self.p('modo_curva_t') == 'giro_frontal' else lado_c
++                        r = self._travessia_lidar(info, 'TRAVESSIA %d' % n, parada, lado_parada, larg_b)
+                         if r != 'ok':
+                             self.get_logger().warn('Travessia pelo LiDAR falhou: voltando ao preparo '
+                                                    'para tentar de novo.')
+                             if self._chegar_preparo(e, 'PREPARO %d (2a tentativa)' % n) == 'ok':
+-                                r = self._travessia_lidar(info, 'TRAVESSIA %d (2a tentativa)' % n, parada, lado_c, larg_b)
++                                r = self._travessia_lidar(info, 'TRAVESSIA %d (2a tentativa)' % n,
++                                                          parada, lado_parada, larg_b)
+                         if r == 'ok' and curva is not None:
+-                            r = self._travessia_lateral(curva, 'CURVA %d' % n)
++                            if self.p('modo_curva_t') == 'giro_frontal':
++                                r = self._travessia_giro_frontal(curva, 'CURVA %d' % n)
++                            else:
++                                r = self._travessia_lateral(curva, 'CURVA %d' % n)
+                             if r == 'ok':
+                                 tratadas.append(curva['entrada_b'])
+                                 continue  # reanalisa o caminho a partir da saida do corredor novo
+diff --git a/src/robo_navigation/scripts/giro_frontal.py b/src/robo_navigation/scripts/giro_frontal.py
+new file mode 100644
+index 0000000..ffe70d5
+--- /dev/null
++++ b/src/robo_navigation/scripts/giro_frontal.py
+@@ -0,0 +1,171 @@
++"""Nucleo conservador da curva em T; sem dependencias ROS."""
++import math
++
++ZERO = (0.0, 0.0, 0.0)
++
++
++def ang(a):
++    return math.atan2(math.sin(a), math.cos(a))
++
++
++def disco_observado(ranges, amin, inc, rmin, rmax, laser, raio, caixa=None):
++    """Exige retornos FINITOS alem do disco em todos os setores de 2 graus.
++
++    Disco circunscrito ao footprint + margem: sobreaproxima toda a varredura.
++    Raios sem retorno/invalidos e setores cegos permanecem desconhecidos.
++    No avanco, caixa substitui o disco pelo footprint dilatado + frenagem frontal.
++    """
++    lx, ly, yaw = laser
++    if not all(math.isfinite(v) for v in (amin, inc, rmin, rmax, lx, ly, yaw, raio)):
++        return False
++    if inc == 0 or rmin < 0 or rmax <= rmin or math.hypot(lx, ly) >= raio:
++        return False
++    vistos = set()
++    for i, r in enumerate(ranges):
++        a = amin + i * inc + yaw
++        c, s = math.cos(a), math.sin(a)
++        b = lx * c + ly * s
++        if caixa is None:
++            saida = -b + math.sqrt(b*b + raio*raio - lx*lx - ly*ly)
++        else:
++            xmin, xmax, ymin, ymax = caixa
++            if not xmin < lx < xmax or not ymin < ly < ymax:
++                return False
++            tx = ((xmax if c > 0 else xmin)-lx)/c if abs(c) > 1e-12 else math.inf
++            ty = ((ymax if s > 0 else ymin)-ly)/s if abs(s) > 1e-12 else math.inf
++            saida = min(tx, ty)
++        # Um retorno antes da borda e obstaculo, inclusive dentro do corpo.
++        if not math.isfinite(r) or not rmin <= r <= rmax:
++            continue
++        if r <= saida + 0.025:
++            return False
++        x, y = lx + saida*c, ly + saida*s
++        vistos.add(int(((math.atan2(y, x) + math.pi) % (2*math.pi)) / (2*math.pi) * 180))
++    return len(vistos) == 180
++
++
++class GiroFrontal:
++    def __init__(self, centro, eixo, saida, margem=0.60, timeout=90.0):
++        self.centro, self.eixo, self.saida = centro, eixo, saida
++        self.margem, self.timeout = margem, timeout
++        self.estado, self.motivo = 'parar', ''
++        self.t0 = self.estavel = self.progresso_t = None
++        self.ref_pose = self.alvo_imu = self.alvo_mapa = None
++        self.melhor = None
++
++    def abortar(self, motivo):
++        self.estado, self.motivo = 'abortar', motivo
++        return ZERO
++
++    def passo(self, t, pose, imu, scan_t, livre, parado, cancelado=False, bloqueado=False):
++        if self.estado in ('fim', 'abortar'):
++            return ZERO
++        if self.t0 is None:
++            self.t0 = self.progresso_t = t
++        if cancelado:
++            return self.abortar('cancelamento')
++        if t - self.t0 > self.timeout:
++            return self.abortar('timeout')
++        if pose is None or not all(math.isfinite(v) for v in pose):
++            return self.abortar('pose ausente/invalida')
++        if imu is None or not all(math.isfinite(v) for v in imu) or not 0 <= t-imu[0] <= 0.3:
++            return self.abortar('IMU ausente/invalida/desatualizada')
++        if scan_t is None or not 0 <= t-scan_t <= 0.3:
++            return self.abortar('LiDAR ausente/desatualizado')
++        if not livre:
++            return self.abortar('obstaculo ou area nao observada')
++        if bloqueado:
++            return self.abortar('protecao ou conflito de controle')
++        if self.estado == 'parar':
++            if math.hypot(pose[0]-self.centro[0], pose[1]-self.centro[1]) > 0.06:
++                return self.abortar('fora do centro seguro do T')
++            if self.ref_pose is None:
++                self.ref_pose = pose
++            moveu = math.hypot(pose[0]-self.ref_pose[0], pose[1]-self.ref_pose[1]) > 0.005
++            if not parado or abs(imu[2]) > 0.03 or moveu:
++                self.estavel, self.ref_pose = None, pose
++                return ZERO
++            if self.estavel is None:
++                self.estavel = t
++            if t-self.estavel >= 0.6:
++                self.alvo_mapa = math.atan2(self.eixo[1], self.eixo[0])
++                delta = ang(self.alvo_mapa-pose[2])
++                if not math.radians(45) <= abs(delta) <= math.radians(135):
++                    return self.abortar('direcao de destino incompativel com curva em T')
++                self.alvo_imu = ang(imu[1]+delta)
++                self.estado, self.estavel = 'girar', None
++                self.melhor, self.progresso_t = abs(delta), t
++            return ZERO
++        if self.estado in ('girar', 'confirmar'):
++            if math.hypot(pose[0]-self.centro[0], pose[1]-self.centro[1]) > 0.06:
++                return self.abortar('base deslocou durante o giro')
++            erro = ang(self.alvo_imu-imu[1])
++            if abs(erro) < self.melhor - math.radians(1):
++                self.melhor, self.progresso_t = abs(erro), t
++            if t-self.progresso_t > 6.0:
++                return self.abortar('giro sem progresso')
++            if abs(erro) <= math.radians(3):
++                self.estado = 'confirmar'
++                if not parado or abs(imu[2]) > 0.03:
++                    self.estavel = None
++                    return ZERO
++                if self.estavel is None:
++                    self.estavel = t
++                if t-self.estavel >= 0.5:
++                    if abs(ang(self.alvo_mapa-pose[2])) > math.radians(5):
++                        return self.abortar('orientacao IMU/mapa divergente')
++                    self.estado, self.melhor, self.progresso_t = 'avancar', None, t
++                return ZERO
++            self.estado, self.estavel = 'girar', None
++            return 0.0, 0.0, math.copysign(min(0.10, max(0.025, 0.5*abs(erro))), erro)
++        erro = ang(self.alvo_imu-imu[1])
++        if abs(erro) > math.radians(5):
++            return self.abortar('orientacao perdida no avanco')
++        restante = self.margem - ((pose[0]-self.saida[0])*self.eixo[0] +
++                                  (pose[1]-self.saida[1])*self.eixo[1])
++        if restante <= 0.02:
++            self.estado = 'fim'
++            return ZERO
++        if self.melhor is None or restante < self.melhor-0.015:
++            self.melhor, self.progresso_t = restante, t
++        if t-self.progresso_t > 5.0:
++            return self.abortar('avanco sem progresso')
++        return 0.03, 0.0, max(-0.025, min(0.025, 0.4*erro))
++
++
++class ArbitragemT:
++    """Uma unica saida, lease experimental, conflito e watchdog travam em zero."""
++    def __init__(self):
++        self.ativo = self.falha = False
++        self.ultimo_normal = self.ultimo_t = None
++
++    def adquirir(self, t):
++        if self.ativo or self.falha or (self.ultimo_normal is not None and t-self.ultimo_normal < 0.6):
++            return False
++        self.ativo, self.falha, self.ultimo_t = True, False, t
++        return True
++
++    def normal(self, t, cmd):
++        if any(abs(v) > 1e-5 for v in cmd):
++            self.ultimo_normal = t
++            if self.ativo:
++                self.falha = True
++        return ZERO if self.ativo or self.falha else cmd
++
++    def experimental(self, t, cmd):
++        if not self.ativo:
++            return ZERO
++        self.ultimo_t = t
++        return ZERO if self.falha else cmd
++
++    def vigiar(self, t):
++        if self.ativo and t-self.ultimo_t > 0.25:
++            self.falha = True
++        return self.ativo
++
++    def resetar(self, t):
++        # Somente apos o operador cancelar as fontes normais e confirmar a area.
++        if self.ultimo_normal is not None and t-self.ultimo_normal < 0.6:
++            return False
++        self.ativo = self.falha = False
++        return True
+diff --git a/src/robo_navigation/scripts/arbitro_t.py b/src/robo_navigation/scripts/arbitro_t.py
+new file mode 100644
+index 0000000..c31050d
+--- /dev/null
++++ b/src/robo_navigation/scripts/arbitro_t.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""Intertravamento na entrada do velocity_smoother, antes do Collision Monitor."""
++import time
++from giro_frontal import ArbitragemT, ZERO
++
++
++def main():
++    import rclpy
++    from rclpy.node import Node
++    from geometry_msgs.msg import TwistStamped
++    from std_msgs.msg import Bool
++    from std_srvs.srv import SetBool, Trigger
++
++    class Arbitro(Node):
++        def __init__(self):
++            super().__init__('arbitro_t')
++            self.a = ArbitragemT()
++            self.pub = self.create_publisher(TwistStamped, '/cmd_vel_nav_seguro', 10)
++            self.falha = self.create_publisher(Bool, '/alinhador/conflito_t', 10)
++            self.create_subscription(TwistStamped, '/cmd_vel_nav', self.normal, 10)
++            self.create_subscription(TwistStamped, '/cmd_vel_nav_t', self.experimental, 10)
++            self.create_service(SetBool, '/alinhador/controle_t', self.controle)
++            self.create_service(Trigger, '/alinhador/reset_controle_t', self.resetar)
++            self.create_timer(0.05, self.tick)
++
++        def enviar(self, cmd):
++            m = TwistStamped()
++            m.header.stamp = self.get_clock().now().to_msg()
++            m.header.frame_id = 'base_link'
++            m.twist.linear.x, m.twist.linear.y, m.twist.angular.z = cmd
++            self.pub.publish(m)
++
++        @staticmethod
++        def cmd(m):
++            return m.twist.linear.x, m.twist.linear.y, m.twist.angular.z
++
++        def normal(self, m):
++            cmd = self.a.normal(time.monotonic(), self.cmd(m))
++            # Zeros tardios do Nav2 nao interrompem a realimentacao experimental.
++            if not self.a.ativo and not self.a.falha:
++                self.pub.publish(m)
++            elif self.a.falha:
++                self.enviar(cmd)
++
++        def experimental(self, m):
++            if self.a.ativo:
++                self.enviar(self.a.experimental(time.monotonic(), self.cmd(m)))
++
++        def controle(self, req, res):
++            if req.data:
++                res.success = self.a.adquirir(time.monotonic())
++            else:
++                self.enviar(ZERO)
++                self.a.ativo = False
++                res.success = True
++            res.message = 'controle exclusivo' if res.success else 'entrada ocupada'
++            return res
++
++        def resetar(self, req, res):
++            self.enviar(ZERO)
++            res.success = self.a.resetar(time.monotonic())
++            res.message = 'reset manual' if res.success else 'cancele as outras fontes primeiro'
++            return res
++
++        def tick(self):
++            self.a.vigiar(time.monotonic())
++            if self.a.ativo and self.a.falha:
++                self.enviar(ZERO)
++            m = Bool()
++            m.data = self.a.falha
++            self.falha.publish(m)
++
++    rclpy.init()
++    n = Arbitro()
++    try:
++        rclpy.spin(n)
++    finally:
++        n.enviar(ZERO)
++        n.destroy_node()
++        rclpy.try_shutdown()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/src/robo_navigation/test/test_giro_frontal.py b/src/robo_navigation/test/test_giro_frontal.py
+new file mode 100644
+index 0000000..aab436c
+--- /dev/null
++++ b/src/robo_navigation/test/test_giro_frontal.py
+@@ -0,0 +1,316 @@
++import math
++from pathlib import Path
++import sys
++import unittest
++
++SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
++sys.path.insert(0, str(SCRIPTS))
++from giro_frontal import GiroFrontal, ArbitragemT, disco_observado, ZERO
++from alinhador_passagem import Encosto, TravessiaLateral
++
++
++class TestGiro(unittest.TestCase):
++    def novo(self, lado=1, timeout=90):
++        return GiroFrontal((0, 0), (0, lado), (0, lado*0.5), timeout=timeout)
++
++    def passo(self, g, t, yaw=0, x=0, y=0, **kw):
++        args = dict(pose=(x, y, yaw), imu=(t, yaw, 0), scan_t=t,
++                    livre=True, parado=True)
++        args.update(kw)
++        return g.passo(t, **args)
++
++    def girando(self, lado=1):
++        g = self.novo(lado)
++        self.assertEqual(self.passo(g, 0), ZERO)
++        self.assertEqual(self.passo(g, 0.7), ZERO)
++        self.assertEqual(g.estado, 'girar')
++        return g
++
++    def test_esquerda_direita_e_conclusao(self):
++        for lado in (-1, 1):
++            with self.subTest(lado=lado):
++                g = self.girando(lado)
++                self.assertGreater(self.passo(g, 0.8)[2]*lado, 0)
++                self.passo(g, 1, yaw=lado*0.8)
++                self.assertEqual(self.passo(g, 2, yaw=lado*math.pi/2), ZERO)
++                self.assertEqual(self.passo(g, 2.6, yaw=lado*math.pi/2), ZERO)
++                self.assertEqual(g.estado, 'avancar')
++                cmd = self.passo(g, 2.7, yaw=lado*math.pi/2)
++                self.assertGreater(cmd[0], 0)
++                self.assertEqual(cmd[1], 0)
++                self.assertEqual(self.passo(g, 3, yaw=lado*math.pi/2, y=lado*1.1), ZERO)
++                self.assertEqual(g.estado, 'fim')
++
++    def test_sem_espaco(self):
++        g = self.girando()
++        self.assertEqual(self.passo(g, 1, livre=False), ZERO)
++        self.assertEqual(g.estado, 'abortar')
++
++    def test_imu_ausente_invalida_antiga(self):
++        for imu in (None, (0, 0, 0), (1, float('nan'), 0), (1, 0, float('inf'))):
++            g = self.girando()
++            self.assertEqual(self.passo(g, 1, imu=imu), ZERO)
++            self.assertEqual(g.estado, 'abortar')
++
++    def test_lidar_ausente_antigo_futuro(self):
++        for stamp in (None, 0, 2):
++            g = self.girando()
++            self.assertEqual(self.passo(g, 1, scan_t=stamp), ZERO)
++            self.assertEqual(g.estado, 'abortar')
++
++    def test_timeout_cancelamento_bloqueio(self):
++        for kw in ({'cancelado': True}, {'bloqueado': True}):
++            g = self.girando()
++            self.assertEqual(self.passo(g, 1, **kw), ZERO)
++            self.assertEqual(g.estado, 'abortar')
++        g = self.novo(timeout=0.5)
++        self.passo(g, 0)
++        self.assertEqual(self.passo(g, 0.6), ZERO)
++        self.assertEqual(g.motivo, 'timeout')
++
++    def test_sem_progresso_no_giro_e_avanco(self):
++        g = self.girando()
++        self.assertEqual(self.passo(g, 7), ZERO)
++        self.assertIn('sem progresso', g.motivo)
++        g = self.girando()
++        self.passo(g, 1, yaw=math.pi/2)
++        self.passo(g, 1.6, yaw=math.pi/2)
++        self.passo(g, 1.7, yaw=math.pi/2)
++        self.assertEqual(self.passo(g, 7, yaw=math.pi/2), ZERO)
++        self.assertIn('sem progresso', g.motivo)
++
++    def test_centro_parada_e_confirmacao(self):
++        g = self.novo()
++        self.assertEqual(self.passo(g, 0, x=0.1), ZERO)
++        self.assertEqual(g.estado, 'abortar')
++        g = self.novo()
++        for t in (0, 1, 2):
++            self.assertEqual(self.passo(g, t, parado=False), ZERO)
++        self.assertEqual(g.estado, 'parar')
++        g = self.girando()
++        self.passo(g, 1, imu=(1, math.pi/2, 0))
++        self.passo(g, 1.6, imu=(1.6, math.pi/2, 0))
++        self.assertEqual(g.estado, 'abortar')
++
++    def test_giro_independe_origem_da_imu(self):
++        g = self.novo()
++        self.passo(g, 0, imu=(0, 0.4, 0))
++        self.passo(g, 0.7, imu=(0.7, 0.4, 0))
++        self.assertAlmostEqual(g.alvo_imu, math.pi/2+0.4)
++
++
++class TestObservacao(unittest.TestCase):
++    def livre(self, ranges, laser=(0, 0, 0), inc=math.pi/360):
++        return disco_observado(ranges, -math.pi, inc, 0.05, 10, laser, 0.54)
++
++    def test_disco_total_observado(self):
++        self.assertTrue(self.livre([2]*720))
++        self.assertTrue(self.livre([2]*720, laser=(0.12, 0.02, 0.1)))
++
++    def test_obstaculo_e_setores_desconhecidos(self):
++        self.assertFalse(self.livre([float('inf')]*720))
++        self.assertFalse(self.livre([float('nan')]*720))
++        self.assertFalse(self.livre([2]*500))
++        r = [2]*720
++        r[200] = 0.4
++        self.assertFalse(self.livre(r))
++        r[200:220] = [float('inf')]*20
++        self.assertFalse(self.livre(r))
++
++    def test_avanco_cabe_no_corredor_sem_exigir_disco_de_giro(self):
++        ranges = []
++        for i in range(720):
++            a = -math.pi+i*math.pi/360
++            ranges.append(min(3.0, 0.41/abs(math.sin(a))) if abs(math.sin(a)) > 1e-9 else 3.0)
++        self.assertFalse(self.livre(ranges))
++        self.assertTrue(disco_observado(ranges, -math.pi, math.pi/360, 0.05, 10,
++                                       (0, 0, 0), 0.54, caixa=(-0.255, 0.535, -0.365, 0.365)))
++        ranges[360] = 0.5
++        self.assertFalse(disco_observado(ranges, -math.pi, math.pi/360, 0.05, 10,
++                                        (0, 0, 0), 0.54, caixa=(-0.255, 0.535, -0.365, 0.365)))
++
++
++class TestArbitragem(unittest.TestCase):
++    def test_passagem_normal_e_exclusividade(self):
++        a = ArbitragemT()
++        cmd = (0.1, 0, 0)
++        self.assertEqual(a.normal(0, cmd), cmd)
++        self.assertFalse(a.adquirir(0.1))
++        self.assertTrue(a.adquirir(1))
++        self.assertFalse(a.adquirir(1))
++        self.assertEqual(a.experimental(1.1, cmd), cmd)
++        self.assertEqual(a.normal(1.2, cmd), ZERO)
++        self.assertEqual(a.experimental(1.3, cmd), ZERO)
++        self.assertTrue(a.falha)
++
++    def test_watchdog_zeros_normais_e_comandos_sem_lease(self):
++        a = ArbitragemT()
++        self.assertEqual(a.experimental(0, (1, 0, 0)), ZERO)
++        a.adquirir(1)
++        self.assertEqual(a.normal(1.1, ZERO), ZERO)
++        self.assertFalse(a.falha)
++        a.vigiar(1.3)
++        self.assertTrue(a.falha)
++        self.assertEqual(a.experimental(1.4, (1, 0, 0)), ZERO)
++
++    def test_falha_trava_ate_reset_manual(self):
++        a = ArbitragemT()
++        a.adquirir(0)
++        a.vigiar(0.3)
++        a.ativo = False  # liberar lease nao apaga falha
++        self.assertEqual(a.normal(0.4, (0.1, 0, 0)), ZERO)
++        self.assertFalse(a.adquirir(1))
++        self.assertFalse(a.resetar(0.5))
++        self.assertTrue(a.resetar(1.1))
++        self.assertEqual(a.normal(1.2, (0.1, 0, 0)), (0.1, 0, 0))
++
++
++class TestEncosto(unittest.TestCase):
++    def encosto(self, estado):
++        e = Encosto(log=lambda _: None)
++        e.t0, e.t_estado, e.estado = 0, 0, estado
++        e.yaw_ref = 0
++        return e
++
++    def medida(self, e, t, folga=0.08, ang=0, centro=0):
++        e.nova_medicao(t, dict(dist=e.pc+folga, ang=ang, centro=centro), (0, 0, 0))
++
++    def test_sem_face_nao_avanca(self):
++        for estado in ('avancar', 'pulso', 'lat_mover'):
++            e = self.encosto(estado)
++            self.assertEqual(e.passo(1, (0, 0, 0)), ZERO)
++            self.assertEqual(e.estado, 'abortar')
++
++    def test_face_perdida_apos_medicao_e_face_antiga(self):
++        e = self.encosto('avancar')
++        self.medida(e, 0.9, folga=0.5)
++        e.nova_medicao(1, None, (0, 0, 0))
++        self.assertEqual(e.passo(1, (0, 0, 0)), ZERO)
++        self.assertEqual(e.estado, 'abortar')
++        e = self.encosto('avancar')
++        self.medida(e, 0, folga=0.5)
++        self.assertEqual(e.passo(1, (0, 0, 0)), ZERO)
++        self.assertEqual(e.estado, 'abortar')
++
++    def test_folga_negativa_nunca_sucesso(self):
++        for estado in ('medir_final', 'avancar', 'esperar'):
++            e = self.encosto(estado)
++            self.medida(e, 1, folga=-0.01)
++            self.assertEqual(e.passo(1, (0, 0, 0)), ZERO)
++            self.assertEqual(e.estado, 'abortar')
++            self.assertIsNone(e.resultado)
++
++    def test_folga_negativa_antes_do_primeiro_passo_fica_travada(self):
++        e = Encosto(log=lambda _: None)
++        self.medida(e, 0, folga=-0.01)
++        self.assertEqual(e.passo(0, (0, 0, 0)), ZERO)
++        self.assertEqual(e.estado, 'abortar')
++
++    def test_resultado_final_fora_limites(self):
++        for ang, centro in ((0.2, 0), (0, 0.1), (0, None)):
++            e = self.encosto('medir_final')
++            e.n_lat_final = 2
++            e.g_final = True
++            for t in (0.7, 0.8, 0.9, 1):
++                self.medida(e, t, ang=ang, centro=centro)
++            self.assertEqual(e.passo(1, (0, 0, 0)), ZERO)
++            self.assertEqual(e.estado, 'abortar')
++
++    def test_sucesso_exige_medicao_final_valida(self):
++        e = self.encosto('medir_final')
++        for t in (0.7, 0.8, 0.9, 1):
++            self.medida(e, t)
++        e.passo(1, (0, 0, 0))
++        self.assertEqual(e.estado, 'fim')
++
++
++class TestLateral(unittest.TestCase):
++    def test_saida_lateral_antiga_nos_dois_sentidos(self):
++        for lado in (-1, 1):
++            t = TravessiaLateral(lado, log=lambda _: None)
++            t.passo(0, (0, 0, 0), 0.5)
++            t.passo(0.5, (0, 0, 0), 0.5)
++            t.passo(2.6, (0, 0, 0), 0.5)
++            self.assertEqual(t.estado, 'deslizar')
++            cmd = t.passo(2.7, (0, 0, 0), 0.5)
++            self.assertGreater(cmd[1]*lado, 0)
++            self.assertEqual(cmd[0], 0)
++            self.assertEqual(t.passo(3, (0, lado*0.5, 0), 0), ZERO)
++            self.assertEqual(t.estado, 'fim')
++
++    def test_estados_iniciais_laterais(self):
++        for lado in (-1, 1):
++            t = TravessiaLateral(lado, log=lambda _: None)
++            self.assertEqual(t.passo(0, (0, 0, 0), 2), ZERO)
++            self.assertEqual(t.lado, lado)
++            self.assertEqual(t.estado, 'assentar')
++
++
++class TestAdaptadorROS(unittest.TestCase):
++    """Executa os metodos reais do no com mensagens/relogio falsos, sem ROS spin."""
++    def setUp(self):
++        import ast
++        import threading
++        import time
++        from types import SimpleNamespace as NS
++        self.NS = NS
++        tree = ast.parse((SCRIPTS/'alinhador_passagem.py').read_text())
++        main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
++        cls = next(n for n in main.body if isinstance(n, ast.ClassDef) and n.name == 'Alinhador')
++        module = ast.Module(body=[cls], type_ignores=[])
++        def twist():
++            return NS(header=NS(stamp=None, frame_id=''),
++                      twist=NS(linear=NS(x=0, y=0), angular=NS(z=0)))
++        ns = dict(Node=object, time=time, math=math, TwistStamped=twist,
++                  yaw_de=lambda q: 2*math.atan2(q.z, q.w))
++        exec(compile(module, str(SCRIPTS/'alinhador_passagem.py'), 'exec'), ns)
++        self.node = ns['Alinhador'].__new__(ns['Alinhador'])
++        self.node.lock = threading.Lock()
++        self.node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=10_000_000_000,
++                                                         to_msg=lambda: 'stamp'))
++
++    def test_imu_rejeita_covariancia_e_stamp_invalidos(self):
++        ns = self.NS
++        msg = ns(header=ns(stamp=ns(sec=10, nanosec=0)),
++                 orientation=ns(x=0, y=0, z=0, w=1),
++                 angular_velocity=ns(z=0), orientation_covariance=[0]*9)
++        self.node.ao_imu(msg)
++        self.assertIsNotNone(self.node.imu_t)
++        msg.orientation_covariance[0] = -1
++        self.node.ao_imu(msg)
++        self.assertIsNone(self.node.imu_t)
++        msg.orientation_covariance[0] = 0
++        msg.header.stamp.sec = 9
++        self.node.ao_imu(msg)
++        self.assertIsNone(self.node.imu_t)
++
++    def test_scan_com_timestamp_antigo_invalida_area(self):
++        self.node.scan_t_raw = 'anterior'
++        msg = self.NS(header=self.NS(stamp=self.NS(sec=9, nanosec=0)))
++        self.node.ao_scan(msg)
++        self.assertIsNone(self.node.scan_t_raw)
++
++    def test_rota_exclusiva_de_comandos(self):
++        normal, experimental = [], []
++        self.node.pub_cmd = self.NS(publish=normal.append)
++        self.node.pub_t = self.NS(publish=experimental.append)
++        self.node.controle_t_ativo = False
++        self.node._publicar_vel(0.1, 0, 0)
++        self.node.controle_t_ativo = True
++        self.node._publicar_vel(0, 0, 0.1)
++        self.assertEqual(len(normal), 1)
++        self.assertEqual(len(experimental), 1)
++        self.assertEqual(experimental[0].twist.angular.z, 0.1)
++
++    def test_topologia_com_publicador_extra_e_recusada(self):
++        self.node.get_name = lambda: 'alinhador_passagem'
++        pubs = {'/cmd_vel_nav_seguro': [self.NS(node_name='arbitro_t')],
++                '/cmd_vel_nav_t': [self.NS(node_name='alinhador_passagem')]}
++        self.node.get_publishers_info_by_topic = pubs.get
++        self.assertTrue(self.node._arbitro_exclusivo())
++        pubs['/cmd_vel_nav_seguro'].append(self.NS(node_name='intruso'))
++        self.assertFalse(self.node._arbitro_exclusivo())
++
++
++if __name__ == '__main__':
++    unittest.main()

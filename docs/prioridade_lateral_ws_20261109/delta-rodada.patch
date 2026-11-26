@@ -1,0 +1,1151 @@
+--- antes/src/robo_navigation/CMakeLists.txt
++++ depois/src/robo_navigation/CMakeLists.txt
+@@ -10,6 +10,7 @@
+ 
+ if(BUILD_TESTING)
+   find_package(ament_cmake_pytest REQUIRED)
++  ament_add_pytest_test(lateral_ws test/test_lateral_ws.py)
+   ament_add_pytest_test(giro_frontal test/test_giro_frontal.py)
+   ament_add_pytest_test(giro_integrado test/test_integrado_t.py TIMEOUT 120)
+ endif()
+--- antes/src/robo_navigation/launch/navigation.launch.py
++++ depois/src/robo_navigation/launch/navigation.launch.py
+@@ -98,7 +98,7 @@
+             DeclareLaunchArgument("limite_vel_angular_real_t", default_value="-1.0"),
+             DeclareLaunchArgument("limite_vel_linear_real_t", default_value="-1.0"),
+             DeclareLaunchArgument("modo_curva_t", default_value="lateral",
+-                                  choices=["lateral", "giro_frontal"]),
++                                  choices=["lateral"]),
+             DeclareLaunchArgument(
+                 "use_sim_time",
+                 default_value="false",
+@@ -173,8 +173,8 @@
+                 name="velocity_smoother",
+                 output="screen",
+                 parameters=common_parameters,
+-                # Entrada arbitrada: /cmd_vel_nav_seguro; saida /cmd_vel_smoothed.
+-                remappings=common_remappings + [("cmd_vel", "cmd_vel_nav_seguro")],
++                # PRIORIDADE_LATERAL_WS_20261109: caminho lateral original; giro suspenso.
++                remappings=common_remappings + [("cmd_vel", "cmd_vel_nav")],
+             ),
+             Node(
+                 package="nav2_collision_monitor",
+@@ -199,13 +199,6 @@
+                     "~/robo_jazzy_ws/src/robo_navigation/scripts/destravar_node.py")],
+                 output="screen",
+             ),
+-            ExecuteProcess(
+-                cmd=["python3", os.path.expanduser(
+-                    "~/robo_jazzy_ws/src/robo_navigation/scripts/arbitro_t.py"),
+-                     "--ros-args", "-p", ["heartbeat_parado:=", PythonExpression([
+-                         "'true' if '", modo_curva_t, "' == 'giro_frontal' else 'false'"])]],
+-                output="screen",
+-            ),
+             ExecuteProcess(  # NAV_TUDO: alinhador: passagens, mesas, START/FINISH
+                 cmd=["python3", os.path.expanduser(
+                     "~/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py"),
+--- antes/src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml
++++ depois/src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml
+@@ -24,7 +24,8 @@
+                 <Inverter>
+                   <PathExpiringTimer seconds="15" path="{path}"/>
+                 </Inverter>
+-                <IsPathValid path="{path}"/>
++                <!-- PRIORIDADE_LATERAL_WS_20261109: verificar o caminho executado pelo FollowPath. -->
++                <IsPathValid path="{smoothed_path}"/>
+               </ReactiveSequence>
+               <Sequence name="ComputeAndSmoothPath">
+               <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" />
+--- antes/src/robo_navigation/scripts/alinhador_passagem.py
++++ depois/src/robo_navigation/scripts/alinhador_passagem.py
+@@ -182,6 +182,7 @@
+     python3 alinhador_passagem.py
+     python3 alinhador_passagem.py --ros-args -p modo_travessia:=nav2   (comportamento v2)
+ """
++from face_ws import selecionar_face, RastreioFaceWS, pose_mapa_no_scan, obstaculo_antes_da_face
+ import json
+ import collections
+ import heapq  # ROTA_MAPA
+@@ -1455,6 +1456,9 @@
+             if novo is None or velho is None or velho < novo + 0.03:
+                 return novo
+             return velho
++        if any(v is not None and v < 0 for v in (frente, tras)):
++            self.abortar('folga negativa medida no corpo')
++            return
+         ult = self._folga_crua
+         self._folga_crua = (frente, tras)
+         if ult is not None:
+@@ -1596,13 +1600,7 @@
+         self._mudar('assentar', t, pose)
+ 
+     def abortar(self, motivo):
+-        # v3.18: com o corpo inteiro ja fora do corredor (>= 35 cm alem da saida, meia
+-        # largura 31,5 cm) o problema nao e mais do corredor: da a saida por concluida e o
+-        # Nav2 segue dali
+-        if self.restante <= self.restante_fora:
+-            self.estado = 'fim'
+-            self.log('Saida lateral concluida (corpo ja fora do corredor; parei por: %s)' % motivo)
+-            return
++        # Falha nao e prova de saida: sucesso so pelo criterio normal de passo().
+         self.estado, self.motivo = 'abortar', motivo
+         self.log('Saida lateral abortada: %s' % motivo)
+ 
+@@ -1617,6 +1615,8 @@
+ 
+     def passo(self, t, pose, restante):
+         """Devolve (vx, vy, wz). restante: metros (no eixo do corredor novo) ate sair dele."""
++        if self.estado in ('fim', 'abortar'):
++            return 0.0, 0.0, 0.0
+         if self.t0 is None:
+             self.t0 = t
+             self.p_inicio = pose
+@@ -1830,62 +1830,9 @@
+ # ---------------------------------------------------------------------------
+ # Encostar de frente numa Service Area pelo LiDAR (sem ROS)
+ # ---------------------------------------------------------------------------
+-def medir_face(pts, x_min=0.30, x_max=1.30, y_lim=0.70, tol=0.02):
+-    """Face da mesa a frente do robo (pontos em base_link).
+-
+-    Devolve dict(dist, ang, centro, span) ou None:
+-      dist   = distancia (m) da origem do base_link ate a face, no eixo x do robo
+-      ang    = quanto girar (rad, + = anti-horario) para ficar de frente (perpendicular)
+-      centro = y do centro da face (m, + = a esquerda) ou None se uma ponta nao aparece
+-    """
+-    sel = [p for p in pts if x_min <= p[0] <= x_max and abs(p[1]) <= y_lim]
+-    if len(sel) < 6:
+-        return None
+-    # reta x = a + b*y (face quase perpendicular ao robo): varre angulos de -25 a +25 graus
+-    melhor = None
+-    for k in range(-50, 51):
+-        th = math.radians(k * 0.5)
+-        c, s = math.cos(th), math.sin(th)
+-        offs = sorted((p[0] * c - p[1] * s, p) for p in sel)
+-        j = 0
+-        for i in range(len(offs)):
+-            while offs[i][0] - offs[j][0] > 0.03:
+-                j += 1
+-            n = i - j + 1
+-            # empate: prefere a reta mais proxima (a face, nao a parede atras da mesa)
+-            if melhor is None or n > melhor[0] or (n == melhor[0] and offs[j][0] < melhor[2]):
+-                melhor = (n, th, offs[j][0], (offs[i][0] + offs[j][0]) / 2.0)
+-    n, th, _, centro_off = melhor
+-    c, s = math.cos(th), math.sin(th)
+-    inl = [p for p in sel if abs(p[0] * c - p[1] * s - centro_off) <= 0.02]
+-    for _ in range(2):
+-        m = len(inl)
+-        if m < 6:
+-            return None
+-        my = sum(p[1] for p in inl) / m
+-        mx = sum(p[0] for p in inl) / m
+-        syy = sum((p[1] - my) ** 2 for p in inl)
+-        if syy < 1e-4:
+-            return None
+-        b = sum((p[1] - my) * (p[0] - mx) for p in inl) / syy
+-        a = mx - b * my
+-        inl = [p for p in sel if abs(p[0] - (a + b * p[1])) < tol]
+-    if len(inl) < 6:
+-        return None
+-    ys = sorted(p[1] for p in inl)
+-    span = ys[-1] - ys[0]
+-    if span < 0.25:
+-        return None
+-    # centro so vale se as duas pontas da face aparecem (nao foram cortadas pela janela)
+-    centro = None
+-    if 0.60 <= span <= 0.98 and ys[0] > -y_lim + 0.05 and ys[-1] < y_lim - 0.05:
+-        yc = (ys[0] + ys[-1]) / 2.0
+-        xc = a + b * yc
+-        # deslocamento do robo ao longo da face (nao muda quando o robo gira no lugar;
+-        # o y puro do centro mudava ~1 cm por grau de giro: teste de 22/10 09:36)
+-        centro = (yc + xc * b) / math.sqrt(1.0 + b * b)
+-    # normal da face no robo: (1, -b) -> girar -atan(b) para ficar perpendicular
+-    return dict(dist=a, ang=-math.atan(b), centro=centro, span=span, n=len(inl))
++def medir_face(pts, x_min=0.30, x_max=1.30, y_lim=0.70, tol=0.02, referencia=None):
++    """Face segmentada; quando ha WS conhecida seleciona pela referencia, nao por densidade."""
++    return selecionar_face(pts,referencia,x_min=x_min,x_max=x_max,y_lim=y_lim,tol=tol)
+ 
+ 
+ class Encosto:
+@@ -1912,6 +1859,7 @@
+         self.avancos = 0
+         self.alvo_giro = self.alvo_lat = self.yaw_ref = None
+         self.resultado = None
++        self.obstaculo = None
+         self.p_dur = 0.15      # duracao do pulso de avanco final (s), ajustada sozinha
+         self.p_ult = None
+         self.n_pulsos = 0
+@@ -1985,8 +1933,13 @@
+         e = self.estado
+         # Nenhum movimento pode continuar usando uma face perdida ou antiga.
+         if e in ('avancar', 'pulso', 'girar', 'deslocar', 'lat_mover', 'lat_pulso') and (
+-                not self.meds or not 0 <= t-self.meds[-1][0] <= 0.3):
++                not self.meds or not 0 <= t-self.meds[-1][0] <= 0.3
++                or self.meds[-1][1]['centro'] is None):
+             self.abortar('face ausente ou desatualizada')
++            return 0.0, 0.0, 0.0
++
++        if e in ('avancar', 'pulso') and self.obstaculo is not None:
++            self.abortar('obstaculo antes da face WS no corredor de avanco')
+             return 0.0, 0.0, 0.0
+ 
+         if e in ('assentar', 'assentar_final'):
+@@ -2261,8 +2214,8 @@
+             self.declare_parameter('limite_vel_linear_real_t', -1.0)
+             self.declare_parameter('topico_scan_temporal_t', '/scan_temporal_front')
+             self.declare_parameter('topico_imu_temporal_t', '/imu/data_temporal')
+-            if self.get_parameter('modo_curva_t').value not in ('lateral', 'giro_frontal'):
+-                raise ValueError('modo_curva_t deve ser lateral ou giro_frontal')
++            if self.get_parameter('modo_curva_t').value != 'lateral':
++                raise ValueError('Giro frontal suspenso: use modo_curva_t:=lateral')
+             self.declare_parameter('sensor_idade_max', 0.5)     # SENSOR_PARADO
+             self.declare_parameter('sensor_espera_max', 60.0)
+             self.declare_parameter('sensor_espera_ponte', 6.0)
+@@ -3588,12 +3541,10 @@
+                         tl.nova_medicao(sc[0], medir_corredor_lateral(
+                             sc[1], tl.lado, tl.largura, self.p('centro_corpo')), sc[2])
+                         tl.nova_folga(sc[0], *folgas_lateral(sc[1], tl.lado))
+-                    pm = self._pose_mapa()
++                    pm = self._pose_mapa_yaw(idade_max=0.3)
+                     if pm is None:
+-                        sem_tf_desde = sem_tf_desde or agora
+-                        if agora - sem_tf_desde > 1.0:
+-                            tl.abortar('sem TF map->base_link')
+-                            break
++                        tl.abortar('TF map->base_link ausente/desatualizada; restante desconhecido')
++                        break
+                     else:
+                         sem_tf_desde = None
+                         restante = margem - ((pm[0] - sx) * bx + (pm[1] - sy) * by)
+@@ -3621,6 +3572,15 @@
+ 
+         def _encostar(self, nome):
+             """Da pose de aproximacao: alinha com a face pelo LiDAR e avanca ate a distancia."""
++            try:
++                import yaml
++                with open(self.p('arquivo_areas')) as fp:
++                    face = (yaml.safe_load(fp) or {})['service_areas'][nome]['face']
++                rastreio = RastreioFaceWS(face)
++            except (OSError, KeyError, TypeError, ValueError) as exc:
++                self._parar()
++                self._publicar_resultado(nome, False, 'referencia WS indisponivel: '+str(exc))
++                return
+             enc = Encosto(linear=self.p('encosto_linear'),
+                           distancia_alvo=self.p('distancia_encosto'), para_choque=self.p('para_choque'),
+                           log=lambda m: self.get_logger().info('ENCOSTAR %s: %s' % (nome, m)))
+@@ -3646,7 +3606,13 @@
+                         break
+                     if sq != seq and sc is not None and sc[2] is not None:
+                         seq = sq
+-                        enc.nova_medicao(sc[0], medir_face(sc[1]), sc[2])
++                        pm = self._pose_mapa_yaw(idade_max=0.3)
++                        pose_scan = pose_mapa_no_scan(pm,od[1:],sc[2]) if pm is not None else None
++                        med = rastreio.medir(sc[1],sc[0],sc[2],pose_scan)
++                        enc.nova_medicao(sc[0], med, sc[2])
++                        enc.obstaculo = obstaculo_antes_da_face(sc[1],med,enc.pc)
++                        if med is None:
++                            self.get_logger().info('ENCOSTAR %s: %s' % (nome,rastreio.motivo))
+                     vx, vy, wz = enc.passo(agora, od[1:])
+                     if enc.estado in ('fim', 'abortar'):
+                         break
+--- /dev/null
++++ depois/src/robo_navigation/scripts/face_ws.py
+@@ -0,0 +1,162 @@
++"""Selecao geometrica de WS e rastreamento de uma unica face; sem ROS."""
++import math
++
++
++def ang(x):
++    return math.atan2(math.sin(x), math.cos(x))
++
++
++def transformar_ponto(p, origem, destino):
++    """Ponto em origem base -> mundo odom -> destino base."""
++    c,s=math.cos(origem[2]),math.sin(origem[2])
++    wx,wy=origem[0]+c*p[0]-s*p[1],origem[1]+s*p[0]+c*p[1]
++    dx,dy=wx-destino[0],wy-destino[1]
++    c,s=math.cos(destino[2]),math.sin(destino[2])
++    return c*dx+s*dy,-s*dx+c*dy
++
++
++def pose_mapa_no_scan(mapa_agora, odom_agora, odom_scan):
++    dx,dy=transformar_ponto((0,0),odom_scan,odom_agora)
++    c,s=math.cos(mapa_agora[2]),math.sin(mapa_agora[2])
++    return (mapa_agora[0]+c*dx-s*dy,mapa_agora[1]+s*dx+c*dy,
++            ang(mapa_agora[2]+odom_scan[2]-odom_agora[2]))
++
++
++def referencia_ws(face, pose):
++    if pose is None or not all(math.isfinite(v) for v in pose):
++        return None
++    if not all(math.isfinite(face[k]) for k in ('x','y','yaw')):
++        return None
++    x,y=transformar_ponto((face['x'],face['y']),(0,0,0),pose)
++    a=ang(face['yaw']-pose[2])
++    if abs(a)>math.radians(25):
++        return None
++    width=face.get('largura_medida',0.8)
++    if not math.isfinite(width) or not .6<=width<=1.0:
++        return None
++    return dict(dist=x+math.tan(a)*y,ang=a,
++                centro=-math.sin(a)*x+math.cos(a)*y,span=width)
++
++
++def _ajustar(points, y_lim, tol):
++    if len(points)<6:return None
++    for _ in range(2):
++        m=len(points)
++        if m<6:return None
++        my=sum(p[1] for p in points)/m;mx=sum(p[0] for p in points)/m
++        sy=sum((p[1]-my)**2 for p in points)
++        if sy<1e-4:return None
++        b=sum((p[1]-my)*(p[0]-mx) for p in points)/sy
++        a=mx-b*my
++        points=[p for p in points if abs(p[0]-a-b*p[1])<=tol]
++    if len(points)<6:return None
++    lo=min(p[1] for p in points);hi=max(p[1] for p in points)
++    span=hi-lo
++    if span<.25:return None
++    yc=(lo+hi)/2;xc=a+b*yc
++    centro=(yc+xc*b)/math.sqrt(1+b*b) if .60<=span<=.98 and lo>-y_lim+.05 and hi<y_lim-.05 else None
++    return dict(dist=a,ang=-math.atan(b),centro=centro,span=span,n=len(points),
++                residual=max(abs(p[0]-a-b*p[1]) for p in points))
++
++
++def candidatos_face(pts,x_min=.30,x_max=1.30,y_lim=.70,tol=.02):
++    """Ate quatro planos; separa segmentos colineares por lacunas >10 cm."""
++    remaining=[p for p in pts if len(p)==2 and all(math.isfinite(v) for v in p)
++               and x_min<=p[0]<=x_max and abs(p[1])<=y_lim]
++    result=[]
++    for _ in range(4):
++        if len(remaining)<6:break
++        best=None
++        for k in range(-50,51):
++            th=math.radians(k*.5);c,s=math.cos(th),math.sin(th)
++            offsets=sorted((x*c-y*s,(x,y)) for x,y in remaining)
++            j=0
++            for i in range(len(offsets)):
++                while offsets[i][0]-offsets[j][0]>.03:j+=1
++                n=i-j+1
++                if best is None or n>best[0] or (n==best[0] and offsets[j][0]<best[2]):
++                    best=(n,th,offsets[j][0],(offsets[i][0]+offsets[j][0])/2)
++        if best[0]<6:break
++        c,s=math.cos(best[1]),math.sin(best[1])
++        line=[p for p in remaining if abs(p[0]*c-p[1]*s-best[3])<=tol]
++        if len(line)<6:break
++        taken=set(line);remaining=[p for p in remaining if p not in taken]
++        line.sort(key=lambda p:p[1])
++        segments=[[]]
++        for p in line:
++            if segments[-1] and math.dist(p,segments[-1][-1])>.10:segments.append([])
++            segments[-1].append(p)
++        for segment in segments:
++            fit=_ajustar(segment,y_lim,tol)
++            if fit is not None:result.append(fit)
++    return result
++
++
++def selecionar_face(pts, referencia=None, **kwargs):
++    candidates=candidatos_face(pts,**kwargs)
++    if referencia is None:
++        return max(candidates,key=lambda m:(m['n'],-m['dist'])) if candidates else None
++    ranked=[]
++    for m in candidates:
++        if m['centro'] is None:continue
++        dd=abs(m['dist']-referencia['dist']); da=abs(ang(m['ang']-referencia['ang']))
++        dc=abs(m['centro']-referencia['centro']);dw=abs(m['span']-referencia['span'])
++        if dd>.15 or da>math.radians(12) or dc>.18 or dw>.12:continue
++        ranked.append((dd/.15+da/math.radians(12)+dc/.18+dw/.12,m))
++    ranked.sort(key=lambda v:v[0])
++    # Alternativas geometricamente equivalentes nao autorizam escolher por densidade.
++    if len(ranked)>1 and ranked[1][0]-ranked[0][0]<.35:return None
++    return ranked[0][1] if ranked else None
++
++
++def projetar_face(m,old,new):
++    # Ponto medido no centro da face e direcao normal, ambos compensados pelo SE(2).
++    a=m['ang'];c,s=math.cos(a),math.sin(a)
++    d=m['dist']*c;t=m['centro']
++    p=transformar_ponto((d*c-t*s,d*s+t*c),old,new)
++    a=ang(a+old[2]-new[2]);c,s=math.cos(a),math.sin(a)
++    if c<.5:return None
++    return dict(dist=(p[0]*c+p[1]*s)/c,ang=a,centro=-p[0]*s+p[1]*c)
++
++
++class RastreioFaceWS:
++    def __init__(self, face):
++        if (not isinstance(face,dict) or
++                any(not isinstance(face.get(k), (int,float)) or not math.isfinite(face[k])
++                    for k in ('x','y','yaw')) or
++                not isinstance(face.get('largura_medida',.8),(int,float)) or
++                not .6<=face.get('largura_medida',.8)<=1.0):
++            raise ValueError('referencia WS invalida')
++        self.face=dict(face);self.ultima=None;self.motivo='' 
++
++    def medir(self,pts,t,odom,pose_mapa):
++        if (not math.isfinite(t) or len(odom)!=3 or
++                not all(math.isfinite(v) for v in odom)):
++            self.ultima=None;self.motivo='tempo ou odometria invalida';return None
++        ref=referencia_ws(self.face,pose_mapa)
++        m=selecionar_face(pts,ref) if ref is not None else None
++        if m is None:
++            self.ultima=None;self.motivo='face ausente, ambigua ou fora da referencia WS'
++            return None
++        old=self.ultima
++        self.ultima=(t,m,odom)
++        if old is None:
++            self.motivo='aguardando segunda observacao coerente';return None
++        if not .03<=t-old[0]<=.3:
++            self.motivo='observacao repetida/antiga';return None
++        predicted=projetar_face(old[1],old[2],odom)
++        if (predicted is None or abs(predicted['dist']-m['dist'])>.06
++            or abs(predicted['centro']-m['centro'])>.06
++            or abs(ang(predicted['ang']-m['ang']))>math.radians(5)):
++            self.ultima=None;self.motivo='salto de referencia geometrica';return None
++        self.motivo='face WS consistente'
++        return m
++
++
++def obstaculo_antes_da_face(pts,med,para_choque=.365):
++    """Um retorno entre para-choque e WS no corredor frontal basta para parar."""
++    if med is None:return None
++    b=-math.tan(med['ang'])
++    gaps=[x-para_choque for x,y in pts if math.isfinite(x) and math.isfinite(y)
++          and abs(y)<=.335 and x>para_choque and x<med['dist']+b*y-.05]
++    return min(gaps) if gaps else None
+--- /dev/null
++++ depois/src/robo_navigation/test/test_lateral_ws.py
+@@ -0,0 +1,246 @@
++"""Cenarios geometricos e regressao sem ROS, motores ou navegacao."""
++import ast
++import math
++from pathlib import Path
++import sys
++import tempfile
++import unittest
++import xml.etree.ElementTree as ET
++import importlib.util
++import subprocess
++import tarfile
++import hashlib
++import json
++from types import SimpleNamespace as NS
++import threading
++import time
++
++ROOT=Path(__file__).resolve().parents[3]
++sys.path.insert(0,str(ROOT/'src/robo_navigation/scripts'))
++from face_ws import (selecionar_face, referencia_ws, RastreioFaceWS, transformar_ponto,
++                     pose_mapa_no_scan, obstaculo_antes_da_face)
++from alinhador_passagem import Encosto, TravessiaLateral
++ZERO=(0.,0.,0.)
++FACE=dict(x=.8,y=0.,yaw=0.,largura_medida=.8)
++
++def segmento(dist=.8,centro=0.,a=0.,width=.8,n=41):
++    # centro medido na tangente; dist e intersecao com eixo x.
++    c,s=math.cos(a),math.sin(a);d=dist*c
++    return [(d*c-s*(centro+width*(i/(n-1)-.5)),
++             d*s+c*(centro+width*(i/(n-1)-.5))) for i in range(n)]
++
++class TestFaceWS(unittest.TestCase):
++    def test_bancada_contra_parede_mais_densa(self):
++        pts=segmento()+segmento(1.15,width=1.3,n=100)
++        self.assertAlmostEqual(selecionar_face(pts,referencia_ws(FACE,ZERO))['dist'],.8)
++
++    def test_ws1_ws2_com_obstaculos_laterais_e_desalinhamento(self):
++        areas=[(dict(x=.859,y=3.862,yaw=-3.096,largura_medida=.87),(1.458,3.889,-3.096)),
++               (dict(x=2.6,y=1.98,yaw=-.0508,largura_medida=.87),(2.001,2.01,-.0508))]
++        for face,pose in areas:
++            for erro in (-.2,0,.2):
++                p=(pose[0],pose[1],pose[2]+erro)
++                ref=referencia_ws(face,p)
++                pts=segmento(ref['dist'],ref['centro'],ref['ang'],.87)+[(.45,.6),(.5,-.62)]
++                med=selecionar_face(pts,ref)
++                self.assertIsNotNone(med)
++                self.assertAlmostEqual(med['ang'],ref['ang'],delta=math.radians(.5))
++                self.assertIsNone(obstaculo_antes_da_face(pts,med))
++
++    def test_amostragem_angular_real_2_graus(self):
++        pts=[(.8,.8*math.tan(math.radians(i))) for i in range(-26,27,2)]
++        med=selecionar_face(pts,referencia_ws(FACE,ZERO))
++        self.assertIsNotNone(med)
++        self.assertAlmostEqual(med['dist'],.8)
++
++    def test_parede_ou_face_incompativel_recusada(self):
++        for pts in (segmento(1.1),segmento(.8,.32),segmento(.8,a=.3),segmento(.8,width=1.3)):
++            self.assertIsNone(selecionar_face(pts,referencia_ws(FACE,ZERO)))
++
++    def test_duas_faces_ambiguas_recusadas(self):
++        self.assertIsNone(selecionar_face(segmento(.75)+segmento(.85),referencia_ws(FACE,ZERO)))
++
++    def test_lacuna_nao_inventa_face_unica(self):
++        pts=[p for p in segmento(n=81) if abs(p[1])>.15]
++        self.assertIsNone(selecionar_face(pts,referencia_ws(FACE,ZERO)))
++
++    def test_rastreio_duas_observacoes_e_perda(self):
++        r=RastreioFaceWS(FACE)
++        self.assertIsNone(r.medir(segmento(),0,ZERO,ZERO))
++        self.assertIsNotNone(r.medir(segmento(),.17,ZERO,ZERO))
++        self.assertIsNone(r.medir([], .34,ZERO,ZERO))
++        self.assertIsNone(r.medir(segmento(),.51,ZERO,ZERO))
++        self.assertIsNotNone(r.medir(segmento(),.68,ZERO,ZERO))
++
++    def test_salto_de_face_nao_rastreado(self):
++        r=RastreioFaceWS(FACE);r.medir(segmento(),0,ZERO,ZERO)
++        self.assertIsNone(r.medir(segmento(.9),.17,ZERO,ZERO))
++        self.assertIn('salto',r.motivo)
++
++    def test_compensacao_do_movimento(self):
++        r=RastreioFaceWS(FACE);pts=segmento()
++        r.medir(pts,0,ZERO,ZERO)
++        nova=(.04,.02,.04)
++        med=r.medir([transformar_ponto(p,ZERO,nova) for p in pts],.17,nova,nova)
++        self.assertIsNotNone(med)
++        self.assertAlmostEqual(med['ang'],-.04)
++        self.assertAlmostEqual(med['centro'],referencia_ws(FACE,nova)['centro'])
++
++    def test_pose_mapa_na_epoca_do_scan(self):
++        self.assertEqual(pose_mapa_no_scan((10,20,math.pi/2),(1,0,0),(0,0,0)),(10,19,math.pi/2))
++
++    def test_tf_ausente_tempo_repetido_antigo_invalido(self):
++        for t,pose in ((0,ZERO),(.6,ZERO),(float('nan'),ZERO),(.17,None)):
++            r=RastreioFaceWS(FACE);r.medir(segmento(),0,ZERO,ZERO)
++            self.assertIsNone(r.medir(segmento(),t,ZERO,pose))
++
++    def test_config_invalida_rejeitada_antes_de_mover(self):
++        for face in ({},None,dict(FACE,x=float('nan')),dict(FACE,largura_medida=5)):
++            with self.assertRaises(ValueError):RastreioFaceWS(face)
++
++    def test_obstaculo_antes_da_face_e_lateral(self):
++        med=selecionar_face(segmento(),referencia_ws(FACE,ZERO))
++        for x in (.366,.5):
++            self.assertIsNotNone(obstaculo_antes_da_face(segmento()+[(x,.1)],med))
++        self.assertIsNone(obstaculo_antes_da_face(segmento()+[(.5,.6)],med))
++
++class TestEncostoWS(unittest.TestCase):
++    def enc(self,e='avancar',med=None):
++        x=Encosto(log=lambda _:None);x.t0=x.t_estado=0;x.estado=e;x.yaw_ref=0
++        if med is not None:x.nova_medicao(.17,med,ZERO)
++        return x
++
++    def test_referencia_perdida_em_todos_movimentos(self):
++        for e in ('avancar','pulso','girar','deslocar','lat_mover','lat_pulso'):
++            for m in (None,dict(dist=.8,ang=0,centro=None)):
++                enc=self.enc(e,m)
++                self.assertEqual(enc.passo(.2,ZERO),ZERO)
++                self.assertEqual(enc.estado,'abortar')
++
++    def test_obstaculo_interposto_para_antes_do_comando(self):
++        for e in ('avancar','pulso'):
++            enc=self.enc(e,dict(dist=.8,ang=0,centro=0))
++            enc.obstaculo=.1
++            self.assertEqual(enc.passo(.2,ZERO),ZERO)
++            self.assertEqual(enc.estado,'abortar')
++
++    def test_desalinhado_corrige_parado_antes_de_avancar(self):
++        for a,centro,estado in ((.12,0,'girar'),(0,.08,'deslocar'),(0,0,'avancar')):
++            enc=self.enc('medir')
++            for t in (.1,.2,.3,.4):enc.nova_medicao(t,dict(dist=.8,ang=a,centro=centro),ZERO)
++            self.assertEqual(enc.passo(.4,ZERO),ZERO)
++            self.assertEqual(enc.estado,estado)
++
++    def test_integracao_face_perdida_interrompe_avanco(self):
++        r=RastreioFaceWS(FACE);r.medir(segmento(),0,ZERO,ZERO)
++        med=r.medir(segmento(),.17,ZERO,ZERO)
++        enc=self.enc(med=med)
++        self.assertGreater(enc.passo(.2,ZERO)[0],0)
++        enc.nova_medicao(.34,r.medir([], .34,ZERO,ZERO),ZERO)
++        self.assertEqual(enc.passo(.35,ZERO),ZERO)
++        self.assertEqual(enc.estado,'abortar')
++
++class TestLateralSeguro(unittest.TestCase):
++    def test_folga_negativa_imediata_antes_do_primeiro_passo(self):
++        x=TravessiaLateral(1,log=lambda _:None)
++        x.nova_folga(0,.1,.1);x.nova_folga(.17,-.01,.1)
++        self.assertEqual(x.passo(.17,ZERO,.2),ZERO)
++        self.assertEqual(x.estado,'abortar')
++
++    def test_falha_perto_da_saida_nao_e_sucesso(self):
++        for motivo in ('timeout','sensor ausente','Collision Monitor'):
++            x=TravessiaLateral(1,log=lambda _:None);x.restante=.1
++            x.abortar(motivo)
++            self.assertEqual(x.estado,'abortar')
++            self.assertEqual(x.passo(.2,ZERO,.1),ZERO)
++
++    def test_centro_pelas_duas_folgas_sem_reduzir_margens(self):
++        x=TravessiaLateral(1,log=lambda _:None)
++        x.nova_folga(0,.14,.06)
++        self.assertAlmostEqual(x._centro_folga(.1),.04)
++        self.assertIsNone(x._centro_folga(1))
++        x.nova_folga(1,.14,.06,True,False)
++        self.assertIsNone(x._centro_folga(1))
++        self.assertEqual(x.folga_min,.045)
++
++class TestAdaptadorLateral(unittest.TestCase):
++    def test_tf_perdida_na_rotina_real_para_sem_comando(self):
++        tree=ast.parse((ROOT/'src/robo_navigation/scripts/alinhador_passagem.py').read_text())
++        func=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='_travessia_lateral')
++        ns=dict(TravessiaLateral=TravessiaLateral,time=time,rclpy=NS(ok=lambda:True))
++        exec(compile(ast.Module(body=[func],type_ignores=[]),'adaptador_lateral','exec'),ns)
++        comandos=[];paradas=[]
++        node=NS(p=lambda key:dict(margem_saida_lateral=.6,angulo_fundido=False,fundido_k_ff=.2,
++            vel_lateral=.08,largura_passagem=.9)[key],lock=threading.Lock(),
++            odom=(time.monotonic(),0,0,0),scan=None,scan_seq=0,cmd_final=(time.monotonic(),True),
++            _pose_mapa=lambda:None,_pose_mapa_yaw=lambda **_:None,
++            get_logger=lambda:NS(info=lambda _:None),_esperar_sensores=lambda _:0,
++            _novo_goal_chegou=lambda:False,_publicar_vel=lambda *c:comandos.append(c),
++            _parar=lambda:paradas.append(ZERO))
++        self.assertEqual(ns['_travessia_lateral'](node,dict(eixo_b=(0,1),saida_b=(0,1),lado=1),'T'),'falha')
++        self.assertEqual(comandos,[]);self.assertEqual(paradas,[ZERO])
++
++class TestReversao(unittest.TestCase):
++    def test_simulada_preserva_arquivos_e_recusa_edicoes_posteriores(self):
++        spec=importlib.util.spec_from_file_location('rollback',ROOT/'ferramentas/reverter_prioridade_lateral_ws.py')
++        mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
++        with tempfile.TemporaryDirectory() as tmp:
++            root=Path(tmp);old=root/'src/antigo.py';new=root/'src/novo.py'
++            old.parent.mkdir();old.write_text('antes')
++            snap=root/mod.SNAP;snap.parent.mkdir(parents=True)
++            with tarfile.open(snap,'w:gz') as tar:tar.add(old,arcname='src/antigo.py')
++            old.write_text('depois');new.write_text('novo')
++            entry=lambda p:dict(path=str(p.relative_to(root)),sha256=mod.digest(p))
++            manifest=dict(modificados_rodada=[entry(old)],novos_codigo_rodada=[entry(new)],snapshot_sha256=mod.digest(snap))
++            mod.reverter(root,manifest)
++            self.assertEqual(old.read_text(),'depois')
++            new.write_text('outra sessao')
++            with self.assertRaises(RuntimeError):mod.reverter(root,manifest,True)
++            self.assertEqual(old.read_text(),'depois')
++            new.write_text('novo');mod.reverter(root,manifest,True)
++            self.assertEqual(old.read_text(),'antes')
++            saved=list((root/'backups').glob('reversao_lateral_ws_*/novos/src/novo.py'))
++            self.assertEqual(len(saved),1);self.assertEqual(saved[0].read_text(),'novo')
++
++class TestConfiguracao(unittest.TestCase):
++    def test_launch_lateral_sem_arbitro_e_com_protecoes(self):
++        tree=ast.parse((ROOT/'src/robo_navigation/launch/navigation.launch.py').read_text())
++        calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call)]
++        arg=next(n for n in calls if getattr(n.func,'id','')=='DeclareLaunchArgument' and n.args and isinstance(n.args[0],ast.Constant) and n.args[0].value=='modo_curva_t')
++        self.assertEqual({k.arg:ast.literal_eval(k.value) for k in arg.keywords},{'default_value':'lateral','choices':['lateral']})
++        source=ast.unparse(tree)
++        self.assertNotIn('arbitro_t.py',source)
++        self.assertNotIn("('cmd_vel', 'cmd_vel_nav_seguro')",source)
++        self.assertIn("('cmd_vel', 'cmd_vel_nav')",source)
++        self.assertIn('nav2_collision_monitor',source)
++        self.assertIn("['modo_curva_t:=', modo_curva_t]",source)
++
++    def test_bt_valida_caminho_seguido(self):
++        root=ET.parse(ROOT/'src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml')
++        checked=root.find('.//IsPathValid').attrib['path']
++        followed=root.find('.//FollowPath').attrib['path']
++        self.assertEqual(checked,followed)
++        # Obstaculo so no atalho suavizado: validar o bruto nao provocaria replanejamento.
++        paths={'{path}':[(0,0),(1,1),(2,0)],'{smoothed_path}':[(0,0),(1,0),(2,0)]}
++        valid=lambda path:all(math.dist(p,(1,0))>.2 for p in path)
++        self.assertTrue(valid(paths['{path}']))
++        self.assertFalse(valid(paths[checked]))
++
++    def test_patch_idempotente_reversivel_em_copia(self):
++        spec=importlib.util.spec_from_file_location('patch_lateral',ROOT/'ferramentas/priorizar_lateral_ws.py')
++        mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
++        for tipo,path in (('launch','launch/navigation.launch.py'),('bt','behavior_trees/navigate_to_pose_smooth.xml')):
++            file=ROOT/'src/robo_navigation'/path
++            old=file.with_name(file.name+'.antes_lateral_ws').read_text()
++            new=mod.transformar(old,tipo)
++            self.assertEqual(new,file.read_text())
++            self.assertEqual(mod.transformar(new,tipo),new)
++            with tempfile.TemporaryDirectory() as tmp:
++                copy=Path(tmp)/file.name;copy.write_text(old)
++                cmd=[sys.executable,str(ROOT/'ferramentas/priorizar_lateral_ws.py'),'--tipo',tipo,'--arquivo',str(copy)]
++                for _ in range(2):subprocess.run(cmd,check=True,capture_output=True)
++                self.assertEqual(copy.read_text(),new)
++                subprocess.run(cmd+['--desfazer'],check=True,capture_output=True)
++                self.assertEqual(copy.read_text(),old)
++
++if __name__=='__main__':unittest.main()
+--- /dev/null
++++ depois/ferramentas/priorizar_lateral_ws.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++"""Patch reversivel: suspender giro e validar o caminho realmente seguido.
++--arquivo permite ensaiar cada patch em copia; --desfazer restaura o backup local.
++"""
++import argparse
++import ast
++from pathlib import Path
++import shutil
++import xml.etree.ElementTree as ET
++
++ROOT=Path(__file__).resolve().parents[1]
++MARCA='PRIORIDADE_LATERAL_WS_20261109'
++
++def transformar(texto, tipo):
++    if MARCA in texto:return texto
++    if tipo=='launch':
++        texto=texto.replace('choices=["lateral", "giro_frontal"]','choices=["lateral"]')
++        texto=texto.replace('# Entrada arbitrada: /cmd_vel_nav_seguro; saida /cmd_vel_smoothed.',
++                            '# '+MARCA+': caminho lateral original; giro suspenso.')
++        texto=texto.replace('[("cmd_vel", "cmd_vel_nav_seguro")]','[("cmd_vel", "cmd_vel_nav")]')
++        inicio=texto.index('            ExecuteProcess(\n                cmd=["python3", os.path.expanduser(\n                    "~/robo_jazzy_ws/src/robo_navigation/scripts/arbitro_t.py")')
++        fim=texto.index('            ExecuteProcess(  # NAV_TUDO: alinhador',inicio)
++        texto=texto[:inicio]+texto[fim:]
++        ast.parse(texto)
++        assert 'arbitro_t.py' not in texto and 'choices=["lateral"]' in texto
++    else:
++        assert texto.count('<IsPathValid path="{path}"/>')==1
++        texto=texto.replace('<IsPathValid path="{path}"/>',
++            '<!-- '+MARCA+': verificar o caminho executado pelo FollowPath. -->\n                <IsPathValid path="{smoothed_path}"/>')
++        ET.fromstring(texto)
++    return texto
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--tipo',choices=('launch','bt'),required=True)
++    p.add_argument('--arquivo',type=Path)
++    p.add_argument('--desfazer',action='store_true')
++    a=p.parse_args()
++    target=a.arquivo or ROOT/('src/robo_navigation/launch/navigation.launch.py' if a.tipo=='launch' else 'src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml')
++    backup=target.with_name(target.name+'.antes_lateral_ws')
++    if a.desfazer:
++        if not backup.exists():p.error('backup inexistente')
++        # Nao descartar edicoes feitas depois da aplicacao.
++        expected=transformar(backup.read_text(),a.tipo)
++        if target.read_text()!=expected:p.error('arquivo mudou depois do patch; reverter manualmente com diff')
++        shutil.copy2(backup,target)
++    else:
++        old=target.read_text();new=transformar(old,a.tipo)
++        if old==new:return
++        if backup.exists():p.error('backup ja existe; conferir antes de reaplicar')
++        shutil.copy2(target,backup)
++        target.write_text(new)
++    print(target)
++
++if __name__=='__main__':main()
+--- /dev/null
++++ depois/ferramentas/reverter_prioridade_lateral_ws.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""Reverte somente esta rodada. Padrao: conferir sem gravar. Nao inicia ROS."""
++import argparse
++import datetime
++import hashlib
++import json
++from pathlib import Path
++import shutil
++import tarfile
++
++ROOT=Path(__file__).resolve().parents[1]
++DOC='docs/prioridade_lateral_ws_20261109'
++SNAP='backups/prioridade_lateral_ws_20261109/antes.tar.gz'
++
++def digest(p):return hashlib.sha256(p.read_bytes()).hexdigest()
++
++def reverter(root,manifest,aplicar=False):
++    root=root.resolve();items=manifest['modificados_rodada']+manifest['novos_codigo_rodada']
++    def path(name):
++        p=root/name
++        if Path(name).is_absolute() or not p.resolve().is_relative_to(root) or p.is_symlink():
++            raise ValueError('caminho inseguro: '+name)
++        return p
++    for item in items:
++        p=path(item['path'])
++        if not p.is_file() or digest(p)!=item['sha256']:
++            raise RuntimeError('arquivo mudou apos entrega: '+item['path'])
++    snap=path(SNAP)
++    if digest(snap)!=manifest['snapshot_sha256']:raise RuntimeError('snapshot mudou')
++    originals=[]
++    with tarfile.open(snap) as tar:
++        for item in manifest['modificados_rodada']:
++            m=tar.getmember(item['path'])
++            if not m.isfile():raise ValueError('snapshot sem arquivo regular')
++            originals.append((path(item['path']),tar.extractfile(m).read(),m.mode))
++    if not aplicar:return 'Conferencia OK; nada alterado.'
++    backup=root/'backups'/('reversao_lateral_ws_'+datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
++    backup.mkdir(parents=True,exist_ok=False)
++    with tarfile.open(backup/'antes_reverter.tar.gz','w:gz') as tar:
++        for item in items:tar.add(path(item['path']),arcname=item['path'])
++    for p,content,mode in originals:
++        p.write_bytes(content);p.chmod(mode & 0o777)
++    for item in manifest['novos_codigo_rodada']:
++        p=path(item['path']);dest=backup/'novos'/item['path'];dest.parent.mkdir(parents=True,exist_ok=True)
++        shutil.move(p,dest)
++    return 'Versao anterior restaurada; arquivos posteriores preservados em '+str(backup)
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--aplicar',action='store_true');a=p.parse_args()
++    manifest=json.loads((ROOT/DOC/'arquivos.json').read_text())
++    print(reverter(ROOT,manifest,a.aplicar))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ depois/ferramentas/analise/revisao_ws_lateral.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""Auditoria offline da Missao 24; le MCAP, nao inicia ROS nem publica comandos.
++Compara selecao antiga e nova; TF amostrado por recepcao, nao prova fisica.
++"""
++import argparse
++import ast
++import json
++import math
++from pathlib import Path
++import sys
++import tarfile
++import tempfile
++import time
++import yaml
++sys.path.insert(0,str(Path(__file__).resolve().parent))
++import analisa_missao as analise
++
++ROOT=Path(__file__).resolve().parents[2]
++sys.path.insert(0,str(ROOT/'src/robo_navigation/scripts'))
++from face_ws import RastreioFaceWS, referencia_ws, candidatos_face
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('bag');p.add_argument('--areas',type=Path,default=Path.home()/'mapas/service_areas.yaml')
++    p.add_argument('--saida',type=Path,required=True);a=p.parse_args()
++    areas=yaml.safe_load(a.areas.read_text())['service_areas']
++    with tarfile.open(ROOT/'backups/prioridade_lateral_ws_20261109/antes.tar.gz') as tar:
++        source=tar.extractfile('src/robo_navigation/scripts/alinhador_passagem.py').read().decode()
++    func=next(n for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name=='medir_face')
++    ns={'math':math};exec(compile(ast.Module(body=[func],type_ignores=[]),'face_previa','exec'),ns)
++    with tempfile.TemporaryDirectory() as tmp:d=analise.carregar(analise.achar_mcap(a.bag,tmp)[0])
++    x,y=analise.pontos_corpo(d)
++    intervals=[];start=None
++    for t,_,_,node,msg in d.rosout:
++        if node!='alinhador_passagem':continue
++        if msg.startswith('ENCOSTAR ') and ': medindo a face da mesa' in msg:
++            start=(t,msg.split()[1].rstrip(':'))
++        elif start and msg.startswith('ENCOSTAR '+start[1]+': ') and ('SUCESSO' in msg or 'FALHOU' in msg):
++            intervals.append((*start,t));start=None
++    result=[]
++    for t0,name,t1 in intervals:
++        r=RastreioFaceWS(areas[name]['face']);row=dict(area=name,inicio=analise.hora(t0),fim=analise.hora(t1),scans=0,face_antiga=0,centro_antigo=0,face_ws_nova=0,motivos={})
++        timings=[];row['amostras']=[]
++        for i,t in enumerate(d.scan_t):
++            if not t0<=t<=t1:continue
++            pts=[(float(px),float(py)) for px,py in zip(x[i],y[i]) if math.isfinite(px) and math.isfinite(py)]
++            row['scans']+=1
++            old=ns['medir_face'](pts)
++            row['face_antiga']+=int(old is not None)
++            row['centro_antigo']+=int(old is not None and old['centro'] is not None)
++            od=tuple(analise.amostra(d.odom_base,t)[1:])
++            before=time.perf_counter();med=r.medir(pts,float(t),od,analise.pose_mapa(d,t));timings.append(time.perf_counter()-before)
++            row['face_ws_nova']+=int(med is not None)
++            if row['scans'] in (1,10,30,60):
++                row['amostras'].append(dict(hora=analise.hora(t),pose=analise.pose_mapa(d,t),
++                    referencia=referencia_ws(areas[name]['face'],analise.pose_mapa(d,t)),
++                    antiga=old,candidatos=candidatos_face(pts)))
++            row['motivos'][r.motivo]=row['motivos'].get(r.motivo,0)+1
++        row['tempo_max_seletor_ms']=round(max(timings,default=0)*1000,3)
++        result.append(row)
++    out=dict(limites=['Replay somente geometrico, sem executar maquina de estados ou velocidades.',
++        'TF e scan amostrados por recepcao; sem reconstituir aquisicao ou latencia.',
++        'Usa cadastro atual fornecido em --areas; nao prova identidade semantica da bancada.',
++        'Sem /scan_nav, /bloqueio_virtual e /cmd_vel_ctrl no bag.'],
++        bag=str(a.bag),areas=str(a.areas),encostos=result)
++    a.saida.write_text(json.dumps(out,indent=2,ensure_ascii=False)+'\n')
++    print(json.dumps(out,indent=2,ensure_ascii=False))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ depois/src/robo_navigation/launch/navigation.launch.py.antes_lateral_ws
+@@ -0,0 +1,227 @@
++"""Inicia somente os componentes Nav2 usados pelo robo durante o SLAM."""
++
++import os
++
++from ament_index_python.packages import get_package_share_directory
++from launch import LaunchDescription
++from launch.actions import DeclareLaunchArgument, RegisterEventHandler, TimerAction, ExecuteProcess
++from launch.event_handlers import OnProcessStart
++from launch.substitutions import LaunchConfiguration, PythonExpression
++from launch_ros.parameter_descriptions import ParameterValue
++from launch_ros.actions import Node
++
++
++def generate_launch_description():
++    use_sim_time = LaunchConfiguration("use_sim_time")
++    autostart = LaunchConfiguration("autostart")
++    params_file = LaunchConfiguration("params_file")
++    modo_curva_t = LaunchConfiguration("modo_curva_t")
++
++    navigation_share = get_package_share_directory("robo_navigation")
++    default_params_file = os.path.join(
++        navigation_share, "config", "nav2_params.yaml"
++    )
++
++    default_nav_to_pose_bt_xml = os.path.join(
++        navigation_share,
++        "behavior_trees",
++        "navigate_to_pose_smooth.xml",
++    )
++
++    # O docking_server nao e iniciado: o robo nao possui rotina de docagem.
++    lifecycle_nodes = [
++        "controller_server",
++        "smoother_server",
++        "planner_server",
++        "behavior_server",
++        "bt_navigator",
++        "waypoint_follower",
++        "velocity_smoother",
++        "collision_monitor",
++    ]
++
++    common_parameters = [
++        params_file,
++        {"use_sim_time": use_sim_time},
++    ]
++    common_remappings = [
++        ("/tf", "tf"),
++        ("/tf_static", "tf_static"),
++    ]
++    motion_output_remappings = common_remappings + [
++        ("cmd_vel", "cmd_vel_nav"),
++    ]
++
++    progressive_spin_node = Node(
++        package="robo_progressive_spin",
++        executable="progressive_spin_node",
++        name="progressive_spin",
++        output="screen",
++        parameters=[{"use_sim_time": use_sim_time}],
++    )
++
++    mecanum_escape_node = Node(
++        package="robo_recovery",
++        executable="mecanum_escape_node",
++        name="mecanum_escape_node",
++        output="screen",
++    )
++
++    lifecycle_manager_delayed = RegisterEventHandler(
++        OnProcessStart(
++            target_action=mecanum_escape_node,
++            on_start=[
++                TimerAction(
++                    period=2.0,
++                    actions=[
++                        Node(
++                            package="nav2_lifecycle_manager",
++                            executable="lifecycle_manager",
++                            name="lifecycle_manager_navigation",
++                            output="screen",
++                            parameters=[
++                                {
++                                    "use_sim_time": use_sim_time,
++                                    "autostart": autostart,
++                                    "node_names": lifecycle_nodes,
++                                }
++                            ],
++                        ),
++                    ],
++                ),
++            ],
++        )
++    )
++
++    return LaunchDescription(
++        [
++            DeclareLaunchArgument("limite_vel_angular_real_t", default_value="-1.0"),
++            DeclareLaunchArgument("limite_vel_linear_real_t", default_value="-1.0"),
++            DeclareLaunchArgument("modo_curva_t", default_value="lateral",
++                                  choices=["lateral", "giro_frontal"]),
++            DeclareLaunchArgument(
++                "use_sim_time",
++                default_value="false",
++                description="Usar o relogio de simulacao",
++            ),
++            DeclareLaunchArgument(
++                "autostart",
++                default_value="true",
++                description="Ativar automaticamente os nos de ciclo de vida",
++            ),
++            DeclareLaunchArgument(
++                "params_file",
++                default_value=default_params_file,
++                description="Arquivo de parametros do Nav2",
++            ),
++            Node(
++                package="nav2_controller",
++                executable="controller_server",
++                name="controller_server",
++                output="screen",
++                parameters=common_parameters,
++                remappings=common_remappings + [("cmd_vel", "cmd_vel_ctrl")],  # SUAVIZADOR_NAV: era /cmd_vel_nav
++            ),
++            Node(
++                package="nav2_smoother",
++                executable="smoother_server",
++                name="smoother_server",
++                output="screen",
++                parameters=common_parameters,
++                remappings=common_remappings,
++            ),
++            Node(
++                package="nav2_planner",
++                executable="planner_server",
++                name="planner_server",
++                output="screen",
++                parameters=common_parameters,
++                remappings=common_remappings,
++            ),
++            Node(
++                package="nav2_behaviors",
++                executable="behavior_server",
++                name="behavior_server",
++                output="screen",
++                parameters=common_parameters,
++                remappings=motion_output_remappings,
++            ),
++            Node(
++                package="nav2_bt_navigator",
++                executable="bt_navigator",
++                name="bt_navigator",
++                output="screen",
++                parameters=common_parameters + [
++                    {
++                        "default_nav_to_pose_bt_xml":
++                            default_nav_to_pose_bt_xml,
++                    }
++                ],
++                remappings=common_remappings,
++            ),
++            Node(
++                package="nav2_waypoint_follower",
++                executable="waypoint_follower",
++                name="waypoint_follower",
++                output="screen",
++                parameters=common_parameters,
++                remappings=common_remappings,
++            ),
++            Node(
++                package="nav2_velocity_smoother",
++                executable="velocity_smoother",
++                name="velocity_smoother",
++                output="screen",
++                parameters=common_parameters,
++                # Entrada arbitrada: /cmd_vel_nav_seguro; saida /cmd_vel_smoothed.
++                remappings=common_remappings + [("cmd_vel", "cmd_vel_nav_seguro")],
++            ),
++            Node(
++                package="nav2_collision_monitor",
++                executable="collision_monitor",
++                name="collision_monitor",
++                output="screen",
++                parameters=common_parameters + [{
++                    "stop_pub_timeout": ParameterValue(PythonExpression([
++                        "86400.0 if '", modo_curva_t, "' == 'giro_frontal' else 2.0"]), value_type=float),
++                    "SweptTurnStop.enabled": ParameterValue(
++                        PythonExpression(["'", modo_curva_t, "' == 'giro_frontal'"]), value_type=bool)}],
++                # Parametros fazem /cmd_vel_smoothed -> /cmd_vel.
++                remappings=common_remappings,
++            ),
++            ExecuteProcess(  # NAV_TUDO: filtro do corpo: /scan_front -> /scan_nav
++                cmd=["python3", os.path.expanduser(
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/filtro_corpo_scan.py")],
++                output="screen",
++            ),
++            ExecuteProcess(  # NAV_TUDO: recuperacao destravar (arvore v3)
++                cmd=["python3", os.path.expanduser(
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/destravar_node.py")],
++                output="screen",
++            ),
++            ExecuteProcess(
++                cmd=["python3", os.path.expanduser(
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/arbitro_t.py"),
++                     "--ros-args", "-p", ["heartbeat_parado:=", PythonExpression([
++                         "'true' if '", modo_curva_t, "' == 'giro_frontal' else 'false'"])]],
++                output="screen",
++            ),
++            ExecuteProcess(  # NAV_TUDO: alinhador: passagens, mesas, START/FINISH
++                cmd=["python3", os.path.expanduser(
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py"),
++                     "--ros-args", "-p", ["modo_curva_t:=", modo_curva_t],
++                     "-p", ["limite_vel_angular_real_t:=", LaunchConfiguration("limite_vel_angular_real_t")],
++                     "-p", ["limite_vel_linear_real_t:=", LaunchConfiguration("limite_vel_linear_real_t")]],
++                output="screen",
++            ),
++            ExecuteProcess(  # SUAVIZADOR_NAV: /cmd_vel_ctrl -> /cmd_vel_nav
++                cmd=["python3", os.path.expanduser(
++                    "~/robo_jazzy_ws/src/robo_navigation/scripts/suavizador_nav.py")],
++                output="screen",
++            ),
++
++            progressive_spin_node,
++            mecanum_escape_node,
++            lifecycle_manager_delayed,
++        ]
++    )
+--- /dev/null
++++ depois/src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml.antes_lateral_ws
+@@ -0,0 +1,69 @@
++<root BTCPP_format="4" main_tree_to_execute="MainTree">
++  <!--
++    RECUPERACAO_RAPIDA v1 (26/10)
++    Mudancas em relacao a arvore anterior:
++      - tentativas de recuperacao: 6 -> 4 (depois disso o alinhador decide);
++      - ordem: escape lateral (LiDAR) -> re -> limpar mapas -> smart_spin;
++      - smart_spin com no maximo 12 s (era 24 s);
++      - sem o Wait de 5 s (na arena nao ha ninguem para "sair da frente").
++    O tempo para perceber que travou vem do progress_checker do controller_server
++    (PoseProgressChecker: 6 s sem andar 3 cm nem girar 10 graus).
++  -->
++  <BehaviorTree ID="MainTree">
++    <RecoveryNode number_of_retries="4" name="NavigateRecovery">
++      <PipelineSequence name="NavigateWithReplanning">
++        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector" />
++        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector" />
++        <RateController hz="1.0">
++          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
++            <Fallback name="ManterCaminho"><!-- MANTER_CAMINHO (05/11): so planeja de novo se o caminho atual nao serve -->
++              <ReactiveSequence name="CaminhoAtualServe">
++                <Inverter>
++                  <GlobalUpdatedGoal/>
++                </Inverter>
++                <Inverter>
++                  <PathExpiringTimer seconds="15" path="{path}"/>
++                </Inverter>
++                <IsPathValid path="{path}"/>
++              </ReactiveSequence>
++              <Sequence name="ComputeAndSmoothPath">
++              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" />
++              <SmoothPath unsmoothed_path="{path}" smoothed_path="{smoothed_path}" smoother_id="simple_smoother" max_smoothing_duration="2.0" check_for_collisions="false" error_code_id="{smoothing_path_error_code}" />
++            </Sequence>
++            </Fallback>
++            <Sequence>
++              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}" />
++              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap" />
++            </Sequence>
++          </RecoveryNode>
++        </RateController>
++        <RecoveryNode number_of_retries="0" name="FollowPath"><!-- ARVORE_V3: era 1 -->
++          <FollowPath path="{smoothed_path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}" />
++          <Sequence>
++            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}" />
++            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap" />
++          </Sequence>
++        </RecoveryNode>
++      </PipelineSequence>
++      <Sequence>
++        <Fallback>
++          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}" />
++          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}" />
++        </Fallback>
++        <ReactiveFallback name="RecoveryFallback">
++          <GoalUpdated />
++          <RoundRobin name="RecoveryActions">
++            <!-- ARVORE_V3 (05/11): destravar anda para a direcao com mais espaco (LiDAR) -->
++            <DriveOnHeading server_name="destravar" dist_to_travel="0.15" speed="0.03" time_allowance="8.0" error_code_id="{destravar_code_id}" />
++            <Sequence name="ClearingActions">
++              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap" />
++              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap" />
++            </Sequence>
++            <DriveOnHeading server_name="destravar" dist_to_travel="0.25" speed="0.03" time_allowance="10.0" error_code_id="{destravar_code_id}" />
++            <Spin server_name="smart_spin" spin_dist="0.70" time_allowance="12.0" error_code_id="{spin_error_code}" />
++          </RoundRobin>
++        </ReactiveFallback>
++      </Sequence>
++    </RecoveryNode>
++  </BehaviorTree>
++</root>

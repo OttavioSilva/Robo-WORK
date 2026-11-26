@@ -1,18 +1,20 @@
 robo_hardware:
   ros__parameters:
-    serial_port: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+    # PORTA_BASE (25/11): era /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 (by-id pega base OU garra)
+    # PORTA_USB3 (26/11): base ligada direto na entrada do notebook, sem hub (era usb-0:3.4)
+    serial_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0-port0
     serial_baud: 500000
     serial_startup_delay_s: 5.0
 
     # Dimensoes medidas do robo: entre eixos e entre centros das rodas.
     robot_length_m: 0.340
     robot_width_m: 0.615
-    maximum_wheel_speed_mps: 0.450
+    maximum_wheel_speed_mps: 0.310  # PWM60 (era 0.450): PWM 215 da ~0,31 m/s
     velocity_deadband_mps: 0.005
 
-    minimum_pwm: 150
+    minimum_pwm: 70  # PWM_AJUSTE (05/11): era 60
     # Aplicado apenas quando o comando contém rotação pura.
-    minimum_rotation_pwm: 80
+    minimum_rotation_pwm: 50  # GIRO_50 (05/11): era 80; giro parado minimo ~9 graus/s
     maximum_pwm: 215
     command_rate_hz: 20.0
     command_timeout_s: 0.25
@@ -42,7 +44,7 @@ robo_hardware:
     heading_hold_lateral_kp: 1.6
     heading_hold_lateral_kd: 0.08
     heading_hold_lateral_max_correction_rps: 0.15
-    heading_hold_lateral_feedforward_rps: 0.05
+    heading_hold_lateral_feedforward_rps: 0.0
 
     # Ignora ruido angular pequeno e impede a correcao de giro de dominar o
     # movimento linear em comandos lentos.
@@ -51,3 +53,13 @@ robo_hardware:
     heading_hold_linear_deadband_mps: 0.01
     heading_hold_angular_deadband_rps: 0.02
     heading_hold_imu_timeout_s: 0.20
+
+    # GANHO_LATERAL_YAML (12/11): ganho de PWM por roda so no movimento lateral (peso |vy|/(|vx|+|vy|)).
+    # Teste 12/11: com 1,0 o deslize saia na diagonal (dx/dy ~3); frente/tras e giro continuam com 1,0.
+    # RECALIBRACAO 19/11 (rodas novas): com 1,0 o deslize ficou quase reto (ICP: esq -0,08, dir +0,05 dx/dy,
+    # 2 repeticoes/lado, pulsos 4x0,8 s); 1,6/0,6/0,7/1,6 agora corrige demais (dx/dy -0,68). Volta a 1,0.
+    # Candidato fino ainda nao medido: FL/RR 0,93, FR/RL 1,07 (par FL/RR ~14% mais forte).
+    lateral_wheel_gain_fl: 1.0
+    lateral_wheel_gain_fr: 1.0
+    lateral_wheel_gain_rl: 1.0
+    lateral_wheel_gain_rr: 1.0

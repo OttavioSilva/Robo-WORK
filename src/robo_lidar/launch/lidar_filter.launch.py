@@ -1,21 +1,35 @@
+import os
 from pathlib import Path
+import yaml
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     package_share = Path(get_package_share_directory("robo_lidar"))
-    parameters = package_share / "config" / "lidar.yaml"
+    # LIDAR_M2M2 (24/11): ROBO_LIDAR_CONFIG=lidar_m2m2.yaml troca a config (padrao: Delta-2D)
+    parameters = package_share / "config" / os.environ.get("ROBO_LIDAR_CONFIG", "lidar.yaml")
+
+    with open(parameters) as fp:
+        temporal_parameters = yaml.safe_load(fp)['scan_filter']['ros__parameters']
+    temporal_parameters = dict(temporal_parameters, input_topic='/scan_raw_temporal',
+                               output_topic='/scan_temporal_front')
 
     lidar_x = LaunchConfiguration("lidar_x")
     lidar_y = LaunchConfiguration("lidar_y")
     lidar_z = LaunchConfiguration("lidar_z")
     lidar_yaw = LaunchConfiguration("lidar_yaw")
 
+    body_mount = {  # CORPO_REAL_M35: mascara e TF sempre usam a mesma montagem.
+        'body_laser_x': ParameterValue(lidar_x, value_type=float),
+        'body_laser_y': ParameterValue(lidar_y, value_type=float),
+        'body_laser_yaw': ParameterValue(lidar_yaw, value_type=float),
+    }
     return LaunchDescription(
         [
             DeclareLaunchArgument(
@@ -54,12 +68,14 @@ def generate_launch_description():
                     "--child-frame-id", "laser_raw",
                 ],
             ),
+            Node(package='robo_lidar', executable='scan_filter_node',
+                 name='scan_filter_temporal', output='screen', parameters=[temporal_parameters, body_mount]),
             Node(
                 package="robo_lidar",
                 executable="scan_filter_node",
                 name="scan_filter",
                 output="screen",
-                parameters=[str(parameters)],
+                parameters=[str(parameters), body_mount],
             ),
         ]
     )

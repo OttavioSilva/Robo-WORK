@@ -1,0 +1,450 @@
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 10.0
+    enable_stamped_cmd_vel: true
+    min_x_velocity_threshold: 0.01
+    min_y_velocity_threshold: 0.01
+    min_theta_velocity_threshold: 0.01
+    failure_tolerance: 0.5
+    progress_checker_plugins:
+    - progress_checker
+    goal_checker_plugins:
+    - goal_checker
+    controller_plugins:
+    - FollowPath
+    progress_checker:
+      plugin: "nav2_controller::PoseProgressChecker"  # RECUPERACAO_RAPIDA
+      required_movement_radius: 0.03
+      movement_time_allowance: 6.0
+      required_movement_angle: 0.17
+    goal_checker:
+      plugin: nav2_controller::SimpleGoalChecker
+      stateful: true
+      xy_goal_tolerance: 0.06
+      yaw_goal_tolerance: 0.17  # CHEGADA_10G (05/11): era 0.035; o encosto acerta o angulo
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"  # NAV_INTEGRADA (10/11): DWB direto; era RotationShim (backup .bak_navintegrada_*)
+      debug_trajectory_details: true
+      min_vel_x: -0.10  # NAV_RE_M35: re limitada; zero preservado na grade de 7 amostras
+      max_vel_x: 0.20  # NAV_VEL20 (06/11): era 0.16
+      min_vel_y: -0.08  # NAV_FRENTE (05/11): era -0.16
+      max_vel_y: 0.08  # NAV_FRENTE (05/11): era 0.16
+      max_vel_theta: 0.16  # DWB_GIRO_REAL (05/11): era 0.14
+      min_speed_xy: 0.05  # DWB_GIRO_REAL (05/11): era 0.01
+      max_speed_xy: 0.20  # NAV_VEL20 (06/11): era 0.16
+      min_speed_theta: 0.15  # DWB_GIRO_REAL (05/11): era 0.02
+      acc_lim_x: 0.2
+      acc_lim_y: 0.2
+      acc_lim_theta: 0.4  # DWB_GIRO_REAL (05/11): era 0.2
+      decel_lim_x: -0.5
+      decel_lim_y: -0.5
+      decel_lim_theta: -0.2  # DWB_GIRO_REAL (05/11): era -0.5
+      vx_samples: 7
+      vy_samples: 7
+      vtheta_samples: 7
+      sim_time: 0.8
+      linear_granularity: 0.025
+      angular_granularity: 0.025
+      transform_tolerance: 0.3
+      xy_goal_tolerance: 0.06
+      trans_stopped_velocity: 0.01
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+      critics:
+      - RotateToGoal
+      - Oscillation
+      - ObstacleFootprint
+      - GoalAlign
+      - PathAlign
+      - PathDist
+      - GoalDist
+      - "Twirling"
+      Twirling.class: "dwb_critics::TwirlingCritic"
+      Twirling.scale: 5.0
+      ObstacleFootprint.scale: 0.1
+      PathAlign.scale: 24.0
+      PathAlign.forward_point_distance: 0.1
+      GoalAlign.scale: 18.0
+      GoalAlign.forward_point_distance: 0.1
+      PathDist.scale: 24.0
+      GoalDist.scale: 18.0
+      RotateToGoal.scale: 24.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05
+      transform_tolerance: 0.3
+      footprint: '[[0.365, 0.315], [0.365, -0.315], [-0.205, -0.315], [-0.205, 0.315]]'
+      footprint_padding: 0.01
+      plugins:
+      - obstacle_layer
+      - inflation_layer
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: scan bloqueio  # BLOQUEIO_VIRTUAL
+        scan:
+          topic: /scan_nav  # FILTRO_CORPO: sem os pontos de dentro do robo
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          obstacle_min_range: 0.08
+          obstacle_max_range: 5.0
+          raytrace_min_range: 0.08
+          raytrace_max_range: 5.5
+          max_obstacle_height: 2.0
+          inf_is_valid: true  # INF_VALIDO: raio sem retorno limpa o costmap
+        bloqueio:  # BLOQUEIO_VIRTUAL: faixa onde o robo empacou (destravar v2)
+          topic: /bloqueio_virtual
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          obstacle_min_range: 0.0
+          obstacle_max_range: 8.0
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        enabled: true
+        inflation_radius: 0.55
+        cost_scaling_factor: 5.0
+      always_send_full_costmap: true
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      resolution: 0.05
+      track_unknown_space: true
+      transform_tolerance: 0.3
+      footprint: '[[0.365, 0.315], [0.365, -0.315], [-0.205, -0.315], [-0.205, 0.315]]'
+      footprint_padding: 0.01
+      plugins:  # GLOBAL_OBSTACULOS
+      - static_layer
+      - obstacle_layer
+      - inflation_layer
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        map_subscribe_transient_local: true
+        subscribe_to_updates: true
+      # NAV_INTEGRADA (10/11): tirado o 1o bloco obstacle_layer duplicado (5,0/5,5 m); valia o ultimo
+      obstacle_layer:  # GLOBAL_OBSTACULOS (29/10): obstaculos novos pelo LiDAR
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: scan  # BLOQUEIO_LOCAL (05/11): era "scan bloqueio"; no global fechava a passagem
+        scan:
+          topic: /scan_nav
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          obstacle_min_range: 0.08
+          obstacle_max_range: 3.5
+          raytrace_min_range: 0.08
+          raytrace_max_range: 4.0
+          max_obstacle_height: 2.0
+          inf_is_valid: true  # INF_VALIDO: raio sem retorno limpa o costmap
+        bloqueio:  # BLOQUEIO_VIRTUAL: faixa onde o robo empacou (destravar v2)
+          topic: /bloqueio_virtual
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          obstacle_min_range: 0.0
+          obstacle_max_range: 8.0
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        enabled: true
+        inflation_radius: 0.55
+        cost_scaling_factor: 5.0
+      always_send_full_costmap: true
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 2.0
+    planner_plugins:
+    - GridBased
+    GridBased:
+      plugin: nav2_navfn_planner::NavfnPlanner
+      tolerance: 0.1
+      use_astar: false
+      allow_unknown: true
+smoother_server:
+  ros__parameters:
+    use_sim_time: false
+    smoother_plugins:
+    - simple_smoother
+    simple_smoother:
+      plugin: nav2_smoother::SimpleSmoother
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins:
+    - spin
+    - backup
+    - drive_on_heading
+    - wait
+    spin:
+      plugin: nav2_behaviors::Spin
+    backup:
+      plugin: nav2_behaviors::BackUp
+    drive_on_heading:
+      plugin: nav2_behaviors::DriveOnHeading
+    wait:
+      plugin: nav2_behaviors::Wait
+    local_frame: odom
+    global_frame: map
+    robot_base_frame: base_link
+    transform_tolerance: 0.3
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 0.14
+    min_rotational_vel: 0.04
+    rotational_acc_lim: 0.2
+    enable_stamped_cmd_vel: true
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    wait_for_service_timeout: 1000
+    # CAMINHO_ORIGINAL (11/11): era sem plugin_lib_names (so os plugins do Nav2)
+    plugin_lib_names:
+    - robo_caminho_original_seguro_bt_node
+    - robo_caminho_sem_carimbo_bt_node  # GOAL_TF_ATUAL (11/11)
+    navigators:
+    - navigate_to_pose
+    - navigate_through_poses
+    navigate_to_pose:
+      plugin: nav2_bt_navigator::NavigateToPoseNavigator
+    navigate_through_poses:
+      plugin: nav2_bt_navigator::NavigateThroughPosesNavigator
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    loop_rate: 10
+    stop_on_failure: false
+    action_server_result_timeout: 900.0
+    waypoint_task_executor_plugin: wait_at_waypoint
+    wait_at_waypoint:
+      plugin: nav2_waypoint_follower::WaitAtWaypoint
+      enabled: true
+      waypoint_pause_duration: 0
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 20.0
+    scale_velocities: true
+    feedback: OPEN_LOOP
+    max_velocity:
+    - 0.20  # NAV_VEL20 (06/11): era 0.16
+    - 0.16
+    - 0.40  # GIRO_RAPIDO (era 0.14; o DWB continua limitado a 0.14)
+    min_velocity:
+    - -0.16  # NAV_VEL16 (era -0.08)
+    - -0.16
+    - -0.40
+    max_accel:
+    - 0.2
+    - 0.2
+    - 0.8
+    max_decel:
+    - -0.5
+    - -0.5
+    - -1.2  # GIRO_UMA_VEZ: para o giro rapido em ~0.3 s
+    odom_topic: /odom
+    odom_duration: 0.1
+    deadband_velocity:
+    - 0.015
+    - 0.015
+    - 0.015
+    velocity_timeout: 0.3
+    enable_stamped_cmd_vel: true
+collision_monitor:
+  ros__parameters:
+    use_sim_time: false
+    base_frame_id: base_link
+    odom_frame_id: odom
+    cmd_vel_in_topic: cmd_vel_smoothed
+    cmd_vel_out_topic: cmd_vel
+    state_topic: collision_monitor_state
+    transform_tolerance: 0.3
+    source_timeout: 0.5  # CM_TIMEOUT (06/11): era 1.0; normal 0,17 s, scan perdido 0,34 s
+    base_shift_correction: true
+    stop_pub_timeout: 2.0
+    enable_stamped_cmd_vel: true
+
+    polygons:
+    - VelocityPolygonStop
+    - SweptTurnStop
+
+    VelocityPolygonStop:
+      type: velocity_polygon
+      action_type: stop
+      min_points: 3
+      visualize: true
+      polygon_pub_topic: collision_monitor_velocity_polygon
+      enabled: true
+      holonomic: true
+
+      velocity_polygons:
+      - forward
+      - forward_rapido  # CM_FRENTE
+      - left
+      - backward
+      - right
+      - stopped
+      - giro_esq
+      - giro_dir
+
+      # Movimento predominantemente para frente:
+      # -45 graus ate +45 graus.
+      forward:
+        points: "[[0.425, 0.325], [0.425, -0.325], [-0.050, -0.325], [-0.050, 0.325]]"
+        linear_min: 0.005
+        linear_max: 0.05  # CM_FRENTE: so devagar (era 0.35)
+        direction_start_angle: -0.785
+        direction_end_angle: 0.785
+        theta_min: -0.60
+        theta_max: 0.60
+
+      # CM_FRENTE: para a frente rapido (Nav2), 12 cm alem do para-choque
+      forward_rapido:
+        points: "[[0.485, 0.325], [0.485, -0.325], [-0.050, -0.325], [-0.050, 0.325]]"
+        linear_min: 0.05
+        linear_max: 0.35
+        direction_start_angle: -0.785
+        direction_end_angle: 0.785
+        theta_min: -0.6
+        theta_max: 0.6
+
+      # Movimento para a esquerda:
+      # +45 graus ate +135 graus.
+      left:
+        points: "[[0.425, 0.375], [0.425, -0.050], [-0.225, -0.050], [-0.225, 0.375]]"  # CM_RIGIDO (09/11): frente 0.385 -> 0.425
+        linear_min: 0.005
+        linear_max: 0.35  # NAV_VEL16 (era 0.20)
+        direction_start_angle: 0.785
+        direction_end_angle: 2.356
+        theta_min: -0.60
+        theta_max: 0.60
+
+      # Movimento predominantemente de re:
+      # +135 graus passando por pi ate -135 graus.
+      backward:
+        points: "[[0.050, 0.325], [0.050, -0.325], [-0.315, -0.325], [-0.315, 0.325]]"
+        linear_min: 0.005
+        linear_max: 0.35  # NAV_VEL16 (era 0.20)
+        direction_start_angle: 2.356
+        direction_end_angle: -2.356
+        theta_min: -0.60
+        theta_max: 0.60
+
+      # Movimento para a direita:
+      # -135 graus ate -45 graus.
+      right:
+        points: "[[0.425, 0.050], [0.425, -0.375], [-0.225, -0.375], [-0.225, 0.050]]"  # CM_RIGIDO (09/11): frente 0.385 -> 0.425
+        linear_min: 0.005
+        linear_max: 0.35  # NAV_VEL16 (era 0.20)
+        direction_start_angle: -2.356
+        direction_end_angle: -0.785
+        theta_min: -0.60
+        theta_max: 0.60
+
+      # Fallback para robo parado ou rotacao praticamente pura.
+      # Aproxima o circulo varrido pelos cantos do footprint.
+      stopped:
+        points: "[[0.405, 0.355], [0.405, -0.355], [-0.245, -0.355], [-0.245, 0.355]]"
+        linear_min: 0.0
+        linear_max: 0.005
+        direction_start_angle: -3.1415
+        direction_end_angle: 3.1415
+        theta_min: -0.20
+        theta_max: 0.20
+
+      # GIRO_RAPIDO: giro parado acima de 0.20 rad/s (RotationShim a 0.40).
+      # 7 cm de margem em volta do footprint (o stopped tem 4 cm).
+      giro_esq:
+        points: "[[0.475, 0.425], [0.475, -0.425], [-0.315, -0.425], [-0.315, 0.425]]"  # CM_RIGIDO (09/11): margem 11 cm (era 7)
+        linear_min: 0.0
+        linear_max: 0.005
+        direction_start_angle: -3.1415
+        direction_end_angle: 3.1415
+        theta_min: 0.20
+        theta_max: 0.60
+
+      giro_dir:
+        points: "[[0.475, 0.425], [0.475, -0.425], [-0.315, -0.425], [-0.315, 0.425]]"  # CM_RIGIDO (09/11): margem 11 cm (era 7)
+        linear_min: 0.0
+        linear_max: 0.005
+        direction_start_angle: -3.1415
+        direction_end_angle: 3.1415
+        theta_min: -0.60
+        theta_max: -0.20
+
+    # Envelope circunscrito (nao inscrito) aos cantos + 5 cm.
+    # Ativado pelo launch SOMENTE no modo experimental. Inclui giros combinados.
+    SweptTurnStop:
+      type: velocity_polygon
+      action_type: stop
+      min_points: 1
+      visualize: true
+      polygon_pub_topic: collision_monitor_swept_turn
+      enabled: false
+      holonomic: true
+      velocity_polygons: [left_turn, right_turn, quiet]
+      left_turn:
+        points: "[[0.532131, 0.105847], [0.451119, 0.301428], [0.301428, 0.451119], [0.105847, 0.532131], [-0.105847, 0.532131], [-0.301428, 0.451119], [-0.451119, 0.301428], [-0.532131, 0.105847], [-0.532131, -0.105847], [-0.451119, -0.301428], [-0.301428, -0.451119], [-0.105847, -0.532131], [0.105847, -0.532131], [0.301428, -0.451119], [0.451119, -0.301428], [0.532131, -0.105847]]"
+        linear_min: 0.0
+        linear_max: 0.35
+        direction_start_angle: -3.141592653589793
+        direction_end_angle: 3.141592653589793
+        theta_min: 0.015
+        theta_max: 0.6
+      right_turn:
+        points: "[[0.532131, 0.105847], [0.451119, 0.301428], [0.301428, 0.451119], [0.105847, 0.532131], [-0.105847, 0.532131], [-0.301428, 0.451119], [-0.451119, 0.301428], [-0.532131, 0.105847], [-0.532131, -0.105847], [-0.451119, -0.301428], [-0.301428, -0.451119], [-0.105847, -0.532131], [0.105847, -0.532131], [0.301428, -0.451119], [0.451119, -0.301428], [0.532131, -0.105847]]"
+        linear_min: 0.0
+        linear_max: 0.35
+        direction_start_angle: -3.141592653589793
+        direction_end_angle: 3.141592653589793
+        theta_min: -0.6
+        theta_max: -0.015
+      quiet:
+        points: "[[0.375, 0.325], [0.375, -0.325], [-0.215, -0.325], [-0.215, 0.325]]"
+        linear_min: 0.0
+        linear_max: 0.35
+        direction_start_angle: -3.141592653589793
+        direction_end_angle: 3.141592653589793
+        theta_min: -0.6
+        theta_max: 0.6
+
+    observation_sources:
+    - scan
+    scan:
+      type: scan
+      topic: /scan_nav  # FILTRO_CORPO: sem os pontos de dentro do robo
+      enabled: true

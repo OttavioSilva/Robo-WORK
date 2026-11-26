@@ -1,0 +1,20 @@
+/tf_static:
+  durability: transient_local
+  reliability: reliable
+  history: keep_last
+  depth: 1
+/map:
+  durability: transient_local
+  reliability: reliable
+  history: keep_last
+  depth: 1
+/local_costmap/costmap:
+  durability: transient_local
+  reliability: reliable
+  history: keep_last
+  depth: 1
+/global_costmap/costmap:
+  durability: transient_local
+  reliability: reliable
+  history: keep_last
+  depth: 1

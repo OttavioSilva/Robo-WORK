@@ -2,7 +2,20 @@ scan_filter:
   ros__parameters:
     input_topic: /scan_raw
     output_topic: /scan_front
-    invert_angles: false
-    blocked_intervals_deg: "-162:-146,-140:-110,100:138,142:160"
+    invert_angles: true
+    blocked_intervals_deg: ""  # CORPO_REAL_M35: autorretorno vira NaN so dentro do corpo, sem cegar obstaculos alem
+    body_filter_enabled: true
+    body_laser_x: 0.330
+    body_laser_y: 0.005
+    body_laser_yaw: 0.0
     force_out_of_range_to_inf: true
+    floor_filter_enabled: true      # CHAO_TRASEIRO 19/11: parado, o feixe traseiro bate no chao a 1,13-1,35 m
+    floor_sector_min_abs_deg: 130.0 # setor traseiro (|angulo| no /scan_front)
+    floor_range_m: 1.05             # traseiro: < 1,05 m = obstaculo; >= 1,05 m = chao (NaN)
+    floor_side_enabled: true        # CHAO_LADOS 19/11 noite: chao tambem nos lados
+    floor_side_min_abs_deg: 60.0    # lados: 60 <= |angulo| < 130 (frente +-60 sem corte)
+    floor_side_range_m: 1.15        # CHAO_ESQUERDA 23/11: era 1.5; chao a esquerda a 1,25-1,45 m
+    floor_front_enabled: false      # CHAO_FRENTE 26/11: na frente o chao aparece a partir de ~1,7 m
+    floor_front_max_abs_deg: 60.0   # frente: |angulo| < 60 (onde comecam os lados)
+    floor_front_range_m: 1.7        # >= 1,7 m na frente = chao (NaN)
     use_sim_time: false

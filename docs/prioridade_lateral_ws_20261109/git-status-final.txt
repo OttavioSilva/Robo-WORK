@@ -1,0 +1,37 @@
+ M ferramentas/gravar_teste.sh
+ M src/robo_hardware/CMakeLists.txt
+ M src/robo_hardware/launch/hardware.launch.py
+ M src/robo_hardware/src/hardware_bridge_node.cpp
+ M src/robo_lidar/launch/lidar_filter.launch.py
+ M src/robo_lidar/package.xml
+ M src/robo_navigation/CMakeLists.txt
+ M src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml
+ M src/robo_navigation/config/nav2_params.yaml
+ M src/robo_navigation/launch/navigation.launch.py
+ M src/robo_navigation/package.xml
+ M src/robo_navigation/scripts/alinhador_passagem.py
+?? backups/giro_frontal_20261109/
+?? backups/giro_frontal_revisao2_20261109/
+?? backups/giro_integrado_20261109/
+?? backups/prioridade_lateral_ws_20261109/
+?? docs/
+?? entregas/
+?? ferramentas/analise/revisao_ws_lateral.py
+?? ferramentas/compilar_firmware_temporal.py
+?? ferramentas/gravacao_qos.yaml
+?? ferramentas/gravar_teste.py
+?? ferramentas/iniciar_teste_giro_t.sh
+?? ferramentas/priorizar_lateral_ws.py
+?? ferramentas/restaurar_arquivos_integrado.py
+?? ferramentas/reverter_prioridade_lateral_ws.py
+?? ferramentas/trajetoria_teste.py
+?? ferramentas/verificar_giro_t.py
+?? firmware/mega_mecanum_temporal/
+?? src/robo_hardware/include/
+?? src/robo_hardware/test/
+?? src/robo_navigation/behavior_trees/navigate_to_pose_smooth.xml.antes_lateral_ws
+?? src/robo_navigation/launch/navigation.launch.py.antes_lateral_ws
+?? src/robo_navigation/scripts/arbitro_t.py
+?? src/robo_navigation/scripts/face_ws.py
+?? src/robo_navigation/scripts/giro_frontal.py
+?? src/robo_navigation/test/

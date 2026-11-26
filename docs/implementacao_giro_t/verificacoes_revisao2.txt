@@ -1,0 +1,105 @@
+test_callback_imu_nao_renova_029_para_058 (test_giro_frontal.TestAdaptadorROS.test_callback_imu_nao_renova_029_para_058) ... ok
+test_imu_rejeita_covariancia_e_stamp_invalidos (test_giro_frontal.TestAdaptadorROS.test_imu_rejeita_covariancia_e_stamp_invalidos) ... ok
+test_precondicao_recusa_driver_180_bins_antes_do_preparo (test_giro_frontal.TestAdaptadorROS.test_precondicao_recusa_driver_180_bins_antes_do_preparo) ... ok
+test_rota_exclusiva_de_comandos (test_giro_frontal.TestAdaptadorROS.test_rota_exclusiva_de_comandos) ... ok
+test_rotina_real_nao_retorna_ok_sem_devolucao (test_giro_frontal.TestAdaptadorROS.test_rotina_real_nao_retorna_ok_sem_devolucao) ... ok
+test_scan_com_timestamp_antigo_invalida_area (test_giro_frontal.TestAdaptadorROS.test_scan_com_timestamp_antigo_invalida_area) ... ok
+test_scan_desconta_duracao_sem_reescrever_header (test_giro_frontal.TestAdaptadorROS.test_scan_desconta_duracao_sem_reescrever_header) ... ok
+test_topologia_com_publicador_extra_e_recusada (test_giro_frontal.TestAdaptadorROS.test_topologia_com_publicador_extra_e_recusada) ... ok
+test_falha_trava_ate_reset_manual (test_giro_frontal.TestArbitragem.test_falha_trava_ate_reset_manual) ... ok
+test_passagem_normal_e_exclusividade (test_giro_frontal.TestArbitragem.test_passagem_normal_e_exclusividade) ... ok
+test_watchdog_zeros_normais_e_comandos_sem_lease (test_giro_frontal.TestArbitragem.test_watchdog_zeros_normais_e_comandos_sem_lease) ... ok
+test_falha_timeout_e_excecoes_nao_sao_sucesso (test_giro_frontal.TestDevolucao.test_falha_timeout_e_excecoes_nao_sao_sucesso) ... ok
+test_release_sem_parada_falha_fechado (test_giro_frontal.TestDevolucao.test_release_sem_parada_falha_fechado) ... ok
+test_reset_nao_libera_manobra_ativa_e_exige_silencio (test_giro_frontal.TestDevolucao.test_reset_nao_libera_manobra_ativa_e_exige_silencio) ... ok
+test_sucesso_somente_apos_estado_parado_confirmado (test_giro_frontal.TestDevolucao.test_sucesso_somente_apos_estado_parado_confirmado) ... ok
+test_face_perdida_apos_medicao_e_face_antiga (test_giro_frontal.TestEncosto.test_face_perdida_apos_medicao_e_face_antiga) ... ok
+test_folga_negativa_antes_do_primeiro_passo_fica_travada (test_giro_frontal.TestEncosto.test_folga_negativa_antes_do_primeiro_passo_fica_travada) ... ok
+test_folga_negativa_nunca_sucesso (test_giro_frontal.TestEncosto.test_folga_negativa_nunca_sucesso) ... ok
+test_resultado_final_fora_limites (test_giro_frontal.TestEncosto.test_resultado_final_fora_limites) ... ok
+test_sem_face_nao_avanca (test_giro_frontal.TestEncosto.test_sem_face_nao_avanca) ... ok
+test_sucesso_exige_medicao_final_valida (test_giro_frontal.TestEncosto.test_sucesso_exige_medicao_final_valida) ... ok
+test_geometria_invalida_e_desconhecida (test_giro_frontal.TestGeometriaRevisao2.test_geometria_invalida_e_desconhecida) ... ok
+test_livre_obstaculo_desconhecido_distintos (test_giro_frontal.TestGeometriaRevisao2.test_livre_obstaculo_desconhecido_distintos) ... ok
+test_obstaculo_tem_precedencia_em_scan_de_baixa_resolucao (test_giro_frontal.TestGeometriaRevisao2.test_obstaculo_tem_precedencia_em_scan_de_baixa_resolucao) ... ok
+test_um_raio_invalido_nao_e_preenchido_por_vizinho (test_giro_frontal.TestGeometriaRevisao2.test_um_raio_invalido_nao_e_preenchido_por_vizinho) ... ok
+test_uma_amostra_por_setor_nao_certifica_setor (test_giro_frontal.TestGeometriaRevisao2.test_uma_amostra_por_setor_nao_certifica_setor) ... ok
+test_centro_parada_e_confirmacao (test_giro_frontal.TestGiro.test_centro_parada_e_confirmacao) ... ok
+test_esquerda_direita_e_conclusao (test_giro_frontal.TestGiro.test_esquerda_direita_e_conclusao) ... ok
+test_giro_independe_origem_da_imu (test_giro_frontal.TestGiro.test_giro_independe_origem_da_imu) ... ok
+test_imu_ausente_invalida_antiga (test_giro_frontal.TestGiro.test_imu_ausente_invalida_antiga) ... ok
+test_lidar_ausente_antigo_futuro (test_giro_frontal.TestGiro.test_lidar_ausente_antigo_futuro) ... ok
+test_sem_espaco (test_giro_frontal.TestGiro.test_sem_espaco) ... ok
+test_sem_progresso_no_giro_e_avanco (test_giro_frontal.TestGiro.test_sem_progresso_no_giro_e_avanco) ... ok
+test_timeout_cancelamento_bloqueio (test_giro_frontal.TestGiro.test_timeout_cancelamento_bloqueio) ... ok
+test_estados_iniciais_laterais (test_giro_frontal.TestLateral.test_estados_iniciais_laterais) ... ok
+test_saida_lateral_antiga_nos_dois_sentidos (test_giro_frontal.TestLateral.test_saida_lateral_antiga_nos_dois_sentidos) ... ok
+test_avanco_cabe_no_corredor_sem_exigir_disco_de_giro (test_giro_frontal.TestObservacao.test_avanco_cabe_no_corredor_sem_exigir_disco_de_giro) ... ok
+test_disco_total_observado (test_giro_frontal.TestObservacao.test_disco_total_observado) ... ok
+test_obstaculo_e_setores_desconhecidos (test_giro_frontal.TestObservacao.test_obstaculo_e_setores_desconhecidos) ... ok
+test_atrasado_ja_na_recebida (test_giro_frontal.TestTempoTotal.test_atrasado_ja_na_recebida) ... ok
+test_driver_publicacao_inclui_varredura_e_fila (test_giro_frontal.TestTempoTotal.test_driver_publicacao_inclui_varredura_e_fila) ... ok
+test_nulo_futuro_negativo_malformado_repetido (test_giro_frontal.TestTempoTotal.test_nulo_futuro_negativo_malformado_repetido) ... ok
+test_recente_preserva_stamp_original (test_giro_frontal.TestTempoTotal.test_recente_preserva_stamp_original) ... ok
+test_regressao_058_segundos (test_giro_frontal.TestTempoTotal.test_regressao_058_segundos) ... ok
+test_salto_e_pausa_de_relogio (test_giro_frontal.TestTempoTotal.test_salto_e_pausa_de_relogio) ... ok
+
+----------------------------------------------------------------------
+Ran 45 tests in 0.426s
+
+OK
+Starting >>> robo_navigation
+UpdateCTestConfiguration  from :/home/marcos/robo_jazzy_ws/build/robo_navigation/CTestConfiguration.ini
+Parse Config file:/home/marcos/robo_jazzy_ws/build/robo_navigation/CTestConfiguration.ini
+   Site: marcos-ThinkPad-E14-Gen-2
+   Build name: (empty)
+ Add coverage exclude regular expressions.
+Create new tag: 20261109-1209 - Experimental
+UpdateCTestConfiguration  from :/home/marcos/robo_jazzy_ws/build/robo_navigation/CTestConfiguration.ini
+Parse Config file:/home/marcos/robo_jazzy_ws/build/robo_navigation/CTestConfiguration.ini
+Test project /home/marcos/robo_jazzy_ws/build/robo_navigation
+Constructing a list of tests
+Done constructing a list of tests
+Updating test list for fixtures
+Added 0 tests to meet fixture requirements
+Checking test dependency graph...
+Checking test dependency graph end
+test 1
+    Start 1: giro_frontal
+
+1: Test command: /usr/bin/python3 "-u" "/opt/ros/jazzy/share/ament_cmake_test/cmake/run_test.py" "/home/marcos/robo_jazzy_ws/build/robo_navigation/test_results/robo_navigation/giro_frontal.xunit.xml" "--package-name" "robo_navigation" "--output-file" "/home/marcos/robo_jazzy_ws/build/robo_navigation/ament_cmake_pytest/giro_frontal.txt" "--command" "/usr/bin/python3" "-u" "-m" "pytest" "/home/marcos/robo_jazzy_ws/src/robo_navigation/test/test_giro_frontal.py" "-o" "cache_dir=/home/marcos/robo_jazzy_ws/build/robo_navigation/ament_cmake_pytest/giro_frontal/.cache" "--junit-xml=/home/marcos/robo_jazzy_ws/build/robo_navigation/test_results/robo_navigation/giro_frontal.xunit.xml" "--junit-prefix=robo_navigation"
+1: Working Directory: /home/marcos/robo_jazzy_ws/build/robo_navigation
+1: Test timeout computed to be: 60
+1: -- run_test.py: invoking following command in '/home/marcos/robo_jazzy_ws/build/robo_navigation':
+1:  - /usr/bin/python3 -u -m pytest /home/marcos/robo_jazzy_ws/src/robo_navigation/test/test_giro_frontal.py -o cache_dir=/home/marcos/robo_jazzy_ws/build/robo_navigation/ament_cmake_pytest/giro_frontal/.cache --junit-xml=/home/marcos/robo_jazzy_ws/build/robo_navigation/test_results/robo_navigation/giro_frontal.xunit.xml --junit-prefix=robo_navigation
+1: ============================= test session starts ==============================
+1: platform linux -- Python 3.12.3, pytest-7.4.4, pluggy-1.4.0
+1: cachedir: build/robo_navigation/ament_cmake_pytest/giro_frontal/.cache
+1: rootdir: /home/marcos/robo_jazzy_ws
+1: plugins: launch-testing-3.4.11, ament-xmllint-0.17.5, ament-pep257-0.17.5, ament-flake8-0.17.5, ament-lint-0.17.5, ament-copyright-0.17.5, launch-testing-ros-0.26.12, colcon-core-0.20.1, typeguard-4.1.5, cov-4.1.0
+1: collected 45 items
+1: 
+1: ../../src/robo_navigation/test/test_giro_frontal.py .................... [ 44%]
+1: .........................                                                [100%]
+1: 
+1: - generated xml file: /home/marcos/robo_jazzy_ws/build/robo_navigation/test_results/robo_navigation/giro_frontal.xunit.xml -
+1: ============================== 45 passed in 0.49s ==============================
+1: -- run_test.py: return code 0
+1: -- run_test.py: verify result file '/home/marcos/robo_jazzy_ws/build/robo_navigation/test_results/robo_navigation/giro_frontal.xunit.xml'
+1/1 Test #1: giro_frontal .....................   Passed    0.91 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Label Time Summary:
+pytest    =   0.91 sec*proc (1 test)
+
+Total Test time (real) =   0.91 sec
+Finished <<< robo_navigation [0.93s]
+
+Summary: 1 package finished [1.12s]
+Summary: 46 tests, 0 errors, 0 failures, 0 skipped
+TravessiaLateral preservado
+_travessia_lateral preservado
+Launch avaliado: ['python3', '/home/marcos/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py', '--ros-args', '-p', 'modo_curva_t:=lateral', '-p', 'atraso_lidar_pre_stamp_max_t:=-1.0', '-p', 'atraso_imu_pre_stamp_max_t:=-1.0']
+Launch avaliado: ['python3', '/home/marcos/robo_jazzy_ws/src/robo_navigation/scripts/alinhador_passagem.py', '--ros-args', '-p', 'modo_curva_t:=giro_frontal', '-p', 'atraso_lidar_pre_stamp_max_t:=-1.0', '-p', 'atraso_imu_pre_stamp_max_t:=-1.0']
+Nenhuma acao de launch executada; nenhum no iniciado.

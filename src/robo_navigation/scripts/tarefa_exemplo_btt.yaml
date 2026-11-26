@@ -1,0 +1,26 @@
+# Tarefa de exemplo no formato do arquivo de equipe do atwork_commander
+# (config/schema_task_equipe.yaml), montada para as 3 mesas de teste.
+# 4 objetos: 2 comecam na WS_1, 1 na WS_2, 1 na WS_3.
+task_id: BTT1
+name: Basic Transportation Test I (exemplo de treino)
+duration_min: 10
+active_service_areas: [WS_1, WS_2, WS_3]
+objects:
+  - {id: 4}
+  - {id: 9}
+  - {id: 17}
+  - {id: 21}
+start_state:
+  WS_1:
+    obj_ids: [4, 9]
+  WS_2:
+    obj_ids: [17]
+  WS_3:
+    obj_ids: [21]
+finish_state:
+  WS_1:
+    obj_ids: [17]
+  WS_2:
+    obj_ids: [4, 21]
+  WS_3:
+    obj_ids: [9]

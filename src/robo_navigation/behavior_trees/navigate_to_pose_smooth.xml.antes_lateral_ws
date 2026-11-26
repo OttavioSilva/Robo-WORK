@@ -1,0 +1,69 @@
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <!--
+    RECUPERACAO_RAPIDA v1 (26/10)
+    Mudancas em relacao a arvore anterior:
+      - tentativas de recuperacao: 6 -> 4 (depois disso o alinhador decide);
+      - ordem: escape lateral (LiDAR) -> re -> limpar mapas -> smart_spin;
+      - smart_spin com no maximo 12 s (era 24 s);
+      - sem o Wait de 5 s (na arena nao ha ninguem para "sair da frente").
+    O tempo para perceber que travou vem do progress_checker do controller_server
+    (PoseProgressChecker: 6 s sem andar 3 cm nem girar 10 graus).
+  -->
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="4" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector" />
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector" />
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <Fallback name="ManterCaminho"><!-- MANTER_CAMINHO (05/11): so planeja de novo se o caminho atual nao serve -->
+              <ReactiveSequence name="CaminhoAtualServe">
+                <Inverter>
+                  <GlobalUpdatedGoal/>
+                </Inverter>
+                <Inverter>
+                  <PathExpiringTimer seconds="15" path="{path}"/>
+                </Inverter>
+                <IsPathValid path="{path}"/>
+              </ReactiveSequence>
+              <Sequence name="ComputeAndSmoothPath">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" />
+              <SmoothPath unsmoothed_path="{path}" smoothed_path="{smoothed_path}" smoother_id="simple_smoother" max_smoothing_duration="2.0" check_for_collisions="false" error_code_id="{smoothing_path_error_code}" />
+            </Sequence>
+            </Fallback>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}" />
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap" />
+            </Sequence>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="0" name="FollowPath"><!-- ARVORE_V3: era 1 -->
+          <FollowPath path="{smoothed_path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}" />
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}" />
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap" />
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <Sequence>
+        <Fallback>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}" />
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}" />
+        </Fallback>
+        <ReactiveFallback name="RecoveryFallback">
+          <GoalUpdated />
+          <RoundRobin name="RecoveryActions">
+            <!-- ARVORE_V3 (05/11): destravar anda para a direcao com mais espaco (LiDAR) -->
+            <DriveOnHeading server_name="destravar" dist_to_travel="0.15" speed="0.03" time_allowance="8.0" error_code_id="{destravar_code_id}" />
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap" />
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap" />
+            </Sequence>
+            <DriveOnHeading server_name="destravar" dist_to_travel="0.25" speed="0.03" time_allowance="10.0" error_code_id="{destravar_code_id}" />
+            <Spin server_name="smart_spin" spin_dist="0.70" time_allowance="12.0" error_code_id="{spin_error_code}" />
+          </RoundRobin>
+        </ReactiveFallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

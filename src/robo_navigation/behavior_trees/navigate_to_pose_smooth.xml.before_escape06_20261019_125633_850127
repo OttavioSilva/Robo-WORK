@@ -1,0 +1,83 @@
+
+<!--
+  This Behavior Tree replans the global path periodically at 1 Hz and it also has
+  recovery actions specific to planning / control as well as general system issues.
+  This will be continuous if a kinematically valid planner is selected.
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <Sequence name="ComputeAndSmoothPath">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+              <SmoothPath
+                unsmoothed_path="{path}"
+                smoothed_path="{smoothed_path}"
+                smoother_id="simple_smoother"
+                max_smoothing_duration="2.0"
+                check_for_collisions="false"
+                error_code_id="{smoothing_path_error_code}"/>
+            </Sequence>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{smoothed_path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <Sequence>
+        <Fallback>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+        </Fallback>
+        <ReactiveFallback name="RecoveryFallback">
+          <GoalUpdated/>
+          <RoundRobin name="RecoveryActions">
+            <BackUp
+              backup_dist="0.10"
+              backup_speed="0.03"
+              time_allowance="6.0"
+              error_code_id="{backup_code_id}"/>
+
+            <!--
+              Recovery holonomica customizada.
+
+              O BT usa o node DriveOnHeading apenas como cliente da action.
+              O servidor /mecanum_escape interpreta dist_to_travel como
+              deslocamento lateral e escolhe automaticamente esquerda/direita
+              usando /scan_front.
+
+              A saida continua passando por:
+              /cmd_vel_nav -> velocity_smoother ->
+              collision_monitor -> /cmd_vel
+            -->
+            <DriveOnHeading
+              server_name="mecanum_escape"
+              dist_to_travel="0.10"
+              speed="0.03"
+              time_allowance="6.0"
+              error_code_id="{mecanum_escape_code_id}"/>
+
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <Spin server_name="smart_spin" spin_dist="0.70" time_allowance="24.0" error_code_id="{spin_error_code}"/>
+            <Wait wait_duration="5.0"/>
+          </RoundRobin>
+        </ReactiveFallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

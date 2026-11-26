@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.8)
+project(sonda_setblackboard)
+find_package(behaviortree_cpp REQUIRED)
+find_package(nav_msgs REQUIRED)
+add_executable(sonda sonda.cpp)
+target_link_libraries(sonda behaviortree_cpp::behaviortree_cpp ${nav_msgs_TARGETS})

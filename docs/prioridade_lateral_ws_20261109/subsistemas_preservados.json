@@ -1,0 +1,12 @@
+{
+  "src/robo_navigation/config/nav2_params.yaml": true,
+  "src/robo_hardware/src/hardware_bridge_node.cpp": true,
+  "src/robo_hardware/launch/hardware.launch.py": true,
+  "src/robo_navigation/scripts/destravar_node.py": true,
+  "src/robo_navigation/scripts/suavizador_nav.py": true,
+  "src/robo_localization/config/localization.yaml": true,
+  "src/robo_lidar/config/lidar.yaml": true,
+  "src/robo_navigation/scripts/arbitro_t.py": true,
+  "src/robo_navigation/scripts/giro_frontal.py": true,
+  "ferramentas/gravar_teste.py": true
+}

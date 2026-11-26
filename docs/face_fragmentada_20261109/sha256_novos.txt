@@ -1,0 +1,2 @@
+674eb72ad95a04bdc2547776abf1d7f9c151ef91f5a05edb834f7cae163324ec  src/robo_navigation/scripts/face_ws.py
+b2bc4602ce942df8b285668da04384a0698a1ad121083328ebbae79319de09a7  src/robo_navigation/scripts/alinhador_passagem.py

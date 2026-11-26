@@ -1,0 +1,13 @@
+ ferramentas/gravar_teste.sh                        |  42 +-
+ src/robo_hardware/CMakeLists.txt                   |   9 +
+ src/robo_hardware/launch/hardware.launch.py        |  17 +-
+ src/robo_hardware/src/hardware_bridge_node.cpp     | 193 +++++++-
+ src/robo_lidar/launch/lidar_filter.launch.py       |   8 +
+ src/robo_lidar/package.xml                         |   1 +
+ src/robo_navigation/CMakeLists.txt                 |   7 +
+ .../behavior_trees/navigate_to_pose_smooth.xml     |   3 +-
+ src/robo_navigation/config/nav2_params.yaml        |  37 ++
+ src/robo_navigation/launch/navigation.launch.py    |  21 +-
+ src/robo_navigation/package.xml                    |   8 +
+ src/robo_navigation/scripts/alinhador_passagem.py  | 516 +++++++++++++++++----
+ 12 files changed, 722 insertions(+), 140 deletions(-)
